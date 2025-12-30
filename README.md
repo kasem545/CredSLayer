@@ -43,7 +43,7 @@ You need `tshark` installed and Python >= 3.5. On some distribution tshark in sh
 Then simply install using :
 
 ```
-$ pip install credslayer
+$ pipx install git+https://github.com/kasem545/CredSLayer
 ```
 
 I recommend you use a [virtualenv](https://docs.python.org/3/library/venv.html) to prevent conflicts.
