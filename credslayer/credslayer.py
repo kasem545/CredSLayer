@@ -35,6 +35,16 @@ def build_argument_parser() -> ArgumentParser:
                         action='append',
                         metavar='PORT:PROTOCOL',
                         help='map a port to a protocol')
+    parser.add_argument('-e', '--extract-files',
+                        metavar='DIR',
+                        help='extract files (images, documents, binaries) from traffic to specified directory')
+    parser.add_argument('--file-types',
+                        help='comma-separated list of file types to extract (e.g., "jpg,png,pdf"). Default: all types')
+    parser.add_argument('--min-file-size',
+                        type=int,
+                        default=100,
+                        metavar='BYTES',
+                        help='minimum file size to extract in bytes (default: 100)')
     parser.add_argument('--debug', action='store_true',
                         help='put CredSLayer and pyshark in debug mode')
 
@@ -103,6 +113,29 @@ def main():
 
         logger.OUTPUT_FILE = open(args.output, "w")
 
+    # Setup file extraction if requested
+    file_extractor = None
+    allowed_types = None
+
+    if args.extract_files:
+        from credslayer.core.file_extractor import FileExtractor, set_file_extractor
+
+        file_extractor = FileExtractor(output_dir=args.extract_files)
+        set_file_extractor(file_extractor)
+
+        # Set minimum file size
+        file_extractor.min_file_size = args.min_file_size
+
+        # Parse allowed file types
+        if args.file_types:
+            allowed_types = [ft.strip().lower() for ft in args.file_types.split(',')]
+            file_extractor.allowed_types = allowed_types
+            logger.info(f"File extraction enabled for types: {', '.join(allowed_types)}")
+        else:
+            logger.info("File extraction enabled for all file types")
+
+        logger.info(f"Files will be extracted to: {args.extract_files}")
+
     if args.listen:
 
         if os.geteuid() != 0:
@@ -139,6 +172,12 @@ def main():
 
             else:
                 traceback.print_exc()
+
+    # Print file extraction summary if enabled
+    from credslayer.core.file_extractor import get_file_extractor
+    file_extractor = get_file_extractor()
+    if file_extractor:
+        print(file_extractor.get_summary())
 
     if logger.OUTPUT_FILE:
         logger.OUTPUT_FILE.close()
