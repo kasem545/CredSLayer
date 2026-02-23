@@ -135,8 +135,15 @@ class ParsersTest(unittest.TestCase):
     def test_mongodb_scram(self):
         credentials_list = process_pcap("samples/mongodb-scram.pcap").get_list_of_all_credentials()
         print(credentials_list)
-        self.assertTrue(Credentials("alice", context={"mechanism": "SCRAM-SHA-256"}) in credentials_list)
         self.assertTrue(len(credentials_list) == 1)
+        creds = credentials_list[0]
+        self.assertEqual(creds.username, "alice")
+        self.assertEqual(creds.context["mechanism"], "SCRAM-SHA-256")
+        self.assertEqual(creds.context["salt"], "QSXCR+Q6sek8bf92")
+        self.assertEqual(creds.context["client_nonce"], "fyko+d2lbbFgONRv9qkxdawL")
+        self.assertEqual(creds.context["server_nonce"], "fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j")
+        self.assertEqual(creds.context["iterations"], "4096")
+        self.assertEqual(creds.context["client_proof"], "FtNXbG+jbgSL8BU6f8mJ+wd/vOM0Tz1Wfhaq/mylRLM=")
 
     def test_pgsql(self):
         credentials_list = process_pcap("samples/pgsql.pcap").get_list_of_all_credentials()
