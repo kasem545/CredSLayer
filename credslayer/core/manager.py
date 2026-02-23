@@ -1,4 +1,5 @@
 # coding: utf-8
+import asyncio
 import os
 import signal
 import time
@@ -12,6 +13,15 @@ from pyshark.tshark.tshark import TSharkNotFoundException
 from credslayer.core import logger, extract, utils
 from credslayer.core.session import SessionsManager, Session, stop_managed_sessions, SessionException
 from credslayer.parsers import parsers, ntlmssp
+
+
+def _setup_eventloop_compat(self):
+    if not self.eventloop or self.eventloop.is_closed():
+        self.eventloop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.eventloop)
+
+
+Capture._setup_eventloop = _setup_eventloop_compat
 
 
 class MalformedPacketException(Exception):
@@ -164,6 +174,7 @@ def process_pcap(filename: str, must_inspect_strings=False, tshark_filter=None, 
     what has been found in the pcap.
     """
 
+    asyncio.set_event_loop(asyncio.new_event_loop())
     logger.DEBUG_MODE = debug
     sessions_manager = SessionsManager()
     Session.creds_found_callback = creds_found_callback
@@ -221,6 +232,7 @@ def active_processing(interface: str, must_inspect_strings=False, tshark_filter=
     """
 
     logger.DEBUG_MODE = debug
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
     sessions = SessionsManager(remove_outdated=True)
     Session.creds_found_callback = creds_found_callback

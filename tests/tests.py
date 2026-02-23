@@ -132,6 +132,12 @@ class ParsersTest(unittest.TestCase):
                                     context={"salt": "]E!r<uX8", "salt2": "Of2c!tIM)\"n'"}) in credentials_list)
         self.assertTrue(len(credentials_list) == 1)
 
+    def test_mongodb_scram(self):
+        credentials_list = process_pcap("samples/mongodb-scram.pcap").get_list_of_all_credentials()
+        print(credentials_list)
+        self.assertTrue(Credentials("alice", context={"mechanism": "SCRAM-SHA-256"}) in credentials_list)
+        self.assertTrue(len(credentials_list) == 1)
+
     def test_pgsql(self):
         credentials_list = process_pcap("samples/pgsql.pcap").get_list_of_all_credentials()
         print(credentials_list)
