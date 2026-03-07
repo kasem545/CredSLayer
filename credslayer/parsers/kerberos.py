@@ -92,7 +92,7 @@ def _get_all_ciphers(layer: BaseLayer):
                     fields = field.all_fields if hasattr(field, 'all_fields') else [field]
                 except AttributeError:
                     fields = [field]
-                ciphers.extend([f.raw_value for f in fields if f is not None and f.raw_value])
+                ciphers.extend([f.raw_value.replace(':', '') for f in fields if f is not None and f.raw_value])
         return ciphers
     
     # Old path: generic 'cipher' field exists
@@ -100,7 +100,7 @@ def _get_all_ciphers(layer: BaseLayer):
         fields = cf.all_fields
     except AttributeError:
         fields = [cf]
-    return [f.raw_value for f in fields if f is not None and f.raw_value]
+    return [f.raw_value.replace(':', '') for f in fields if f is not None and f.raw_value]
 
 
 def _get_all_msg_types(layer: BaseLayer):
