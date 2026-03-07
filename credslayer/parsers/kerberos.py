@@ -28,7 +28,7 @@ Three hash classes are captured:
        [0] Ticket.enc-part   - encrypted with the service account's NTLM hash ← target
        [1] KDC-REP.enc-part  - encrypted with the TGT session key (not crackable)
    Hash format (Hashcat mode 13100):
-       $krb5tgs$<etype>$<username>$$<REALM>$*<service>*$<checksum>$<enc-data>
+       $krb5tgs$<etype>$*<username>$<REALM>$<service>*$<checksum>$<enc-data>
    where <checksum> = first 16 bytes (32 hex chars) of the ticket cipher.
 
 pyshark field → layer attribute mapping (XML/JSON mode, kerberos. prefix stripped):
@@ -325,7 +325,7 @@ def _handle_tgs_rep(session: Session, layer: BaseLayer):
     
     SPN parts from kerberos.SNameString may be comma-separated; join with '/'.
     
-    Hash format: $krb5tgs$<etype>$<user>$$<REALM>$*<service>*$<checksum>$<enc_data>
+    Hash format: $krb5tgs$<etype>$*<user>$<REALM>$<service>*$<checksum>$<enc_data>
     (Hashcat mode 13100)
     """
     # Only output if matching TGS-REQ was seen
@@ -348,8 +348,8 @@ def _handle_tgs_rep(session: Session, layer: BaseLayer):
     svc_label = (sname or "unknown").replace(",", "/")
 
     hash_value = (
-        f"$krb5tgs${etype}${username or 'unknown'}"
-        f"$${realm or 'unknown'}$*{svc_label}*"
+        f"$krb5tgs${etype}$*{username or 'unknown'}"
+        f"${realm or 'unknown'}${svc_label}*"
         f"${checksum}${enc_data}"
     )
 
