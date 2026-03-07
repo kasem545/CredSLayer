@@ -1,7 +1,7 @@
 # coding: utf-8
 
 """
-Kerberos (RFC 4120) parser — cipher extraction modelled after roasting.py
+Kerberos (RFC 4120) parser - cipher extraction modelled after roasting.py
 (MIT License, Javier Álvarez, 2024).
 
 Three hash classes are captured:
@@ -16,8 +16,8 @@ Three hash classes are captured:
    When an account has "Do not require Kerberos pre-authentication" the KDC
    returns an AS-REP whose enc-part is encrypted with the user's password.
    Two kerberos.cipher values appear in each AS-REP packet (in stream order):
-       [0] Ticket.enc-part   — encrypted with the KDC's key (not crackable)
-       [1] KDC-REP.enc-part  — encrypted with the user's password  ← roasting target
+       [0] Ticket.enc-part   - encrypted with the KDC's key (not crackable)
+       [1] KDC-REP.enc-part  - encrypted with the user's password  ← roasting target
    Hash format (Hashcat mode 18200):
        $krb5asrep$<etype>$<username>@<REALM>:<checksum>$<enc-data>
    where <checksum> = first 16 bytes (32 hex chars) of the KDC-REP.enc-part cipher.
@@ -25,8 +25,8 @@ Three hash classes are captured:
 3. Kerberoasting (msg_type=13, TGS-REP)
    Service tickets are encrypted with the service account's NTLM hash.
    Two kerberos.cipher values appear in each TGS-REP packet (in stream order):
-       [0] Ticket.enc-part   — encrypted with the service account's NTLM hash ← target
-       [1] KDC-REP.enc-part  — encrypted with the TGT session key (not crackable)
+       [0] Ticket.enc-part   - encrypted with the service account's NTLM hash ← target
+       [1] KDC-REP.enc-part  - encrypted with the TGT session key (not crackable)
    Hash format (Hashcat mode 13100):
        $krb5tgs$<etype>$*<username>$<REALM>$<service>*$<checksum>$<enc-data>
    where <checksum> = first 16 bytes (32 hex chars) of the ticket cipher.
@@ -167,7 +167,7 @@ def analyse(session: Session, layer: BaseLayer) -> bool:
 
 def _handle_as_req(session: Session, layer: BaseLayer, is_compound: bool = False):
     """
-    AS-REQ — record requesting principal and extract PA-ENC-TIMESTAMP cipher.
+    AS-REQ - record requesting principal and extract PA-ENC-TIMESTAMP cipher.
 
     When padata is present (pre-auth enforced), kerberos.cipher carries the
     PA-ENC-TIMESTAMP blob encrypted with the user's password.  This yields a
@@ -175,10 +175,10 @@ def _handle_as_req(session: Session, layer: BaseLayer, is_compound: bool = False
 
     The realm in the AS-REQ packet is often a short/NetBIOS name (e.g.
     'CERTIFICATE') while the fully-qualified domain name ('CERTIFICATE.HTB') is
-    only present in the AS-REP's crealm field.  We emit the hash immediately
-    (so AS-REQ-only captures still produce output) and record the credential
-    list index so _handle_as_rep can correct the realm in-place once the FQDN
-    becomes known.
+    only present in the AS-REP's crealm field.  We buffer the hash until
+    the matching AS-REP is seen (completed handshake), then emit both.
+    The AS-REP handler will update the realm to FQDN when it arrives.
+    
     """
     username = getattr(layer, "CNameString", None)
     realm = getattr(layer, "realm", None)
@@ -186,12 +186,13 @@ def _handle_as_req(session: Session, layer: BaseLayer, is_compound: bool = False
     if username:
         session["krb_username"] = username
         session["krb_realm"] = realm
+        session["_krb_as_req_seen"] = True  # Mark AS-REQ as seen for pairing
         logger.info(session, f"Kerberos AS-REQ: {username}@{realm}")
 
     # PA-ENC-TIMESTAMP cipher is the only cipher in a standalone AS-REQ.
     # In FAST-protected (compound) packets the layer contains ciphers from
     # the embedded AP-REQ armor as well; ciphers[0] would be the AP-REQ
-    # armor TGT cipher — NOT the user's PA-ENC-TIMESTAMP — which would
+    # armor TGT cipher - NOT the user's PA-ENC-TIMESTAMP - which would
     # produce a crackable-looking but completely wrong hash.  Skip.
     if is_compound:
         return
@@ -203,10 +204,11 @@ def _handle_as_req(session: Session, layer: BaseLayer, is_compound: bool = False
     etype = getattr(layer, "etype", "18")
     cipher_hex = ciphers[0]
 
-    # Store cipher+etype so _handle_as_rep can re-emit with the FQDN realm.
+    # Buffer AS-REQ hash and credentials for pairing with AS-REP
     session["krb_preauth_cipher"] = cipher_hex
     session["krb_preauth_etype"] = etype
-
+    session["krb_preauth_username"] = username
+    session["krb_preauth_realm"] = realm
     hash_value = f"$krb5pa${etype}${username}${realm}${cipher_hex}"
 
     creds = Credentials()
@@ -216,30 +218,34 @@ def _handle_as_req(session: Session, layer: BaseLayer, is_compound: bool = False
     creds.context["EType"] = etype
     creds.context["Type"] = "AS-REQ Pre-auth"
 
+    # Output AS-REQ Pre-auth hash immediately (standalone, independently crackable)
     logger.found(
         session,
         f"Kerberos AS-REQ Pre-auth hash captured for {username}@{realm} "
         f"(hashcat -m 19900):\n{hash_value}",
     )
     session.credentials_list.append(creds)
-    # Record index for in-place realm correction when AS-REP arrives.
-    session["krb_preauth_cred_idx"] = len(session.credentials_list) - 1
+    
+    # Store for potential realm update when AS-REP arrives
+    session["_krb_as_req_hash"] = hash_value
+    session["_krb_as_req_creds"] = creds
+    session["_krb_as_req_cred_idx"] = len(session.credentials_list) - 1
 
 
 def _handle_as_rep(session: Session, layer: BaseLayer):
     """
-    AS-REP — extract KDC-REP.enc-part cipher for AS-REP Roasting.
+    AS-REP - extract KDC-REP.enc-part cipher for AS-REP Roasting.
 
     Stream order of kerberos.cipher in an AS-REP packet:
-        [0]  Ticket.enc-part  (encrypted with KDC key — not useful)
-        [-1] KDC-REP.enc-part (encrypted with user's password — roasting target)
+        [0]  Ticket.enc-part  (encrypted with KDC key - not useful)
+        [-1] KDC-REP.enc-part (encrypted with user's password - roasting target)
 
     Hash format: $krb5asrep$<etype>$<user>@<REALM>:<checksum>$<enc_data>
     (Hashcat mode 18200)
 
     The AS-REP always carries the FQDN in crealm.  We prefer that over the
-    short realm stored during AS-REQ processing, and back-patch the AS-REQ
-    pre-auth credential emitted earlier so both hashes use the correct domain.
+    short realm stored during AS-REQ processing.  We buffer the hash until
+    the matching AS-REQ is seen (completed handshake), then emit both.
     """
     username = session["krb_username"] or getattr(layer, "CNameString", None)
     # crealm / realm in AS-REP is always the FQDN.  Prefer it over the
@@ -253,17 +259,18 @@ def _handle_as_rep(session: Session, layer: BaseLayer):
     # Update session realm to FQDN for subsequent TGS-REQ/REP packets.
     if realm:
         session["krb_realm"] = realm
+        session["_krb_as_rep_seen"] = True  # Mark AS-REP as seen for pairing
 
-    # Back-patch the AS-REQ Pre-auth hash emitted earlier with the FQDN realm.
-    preauth_idx = session["krb_preauth_cred_idx"]
-    if preauth_idx is not None and username and realm:
+    # Update buffered AS-REQ Pre-auth hash with FQDN realm if available
+    cred_idx = session["_krb_as_req_cred_idx"]
+    if cred_idx is not None and username and realm:
         preauth_cipher = session["krb_preauth_cipher"]
         preauth_etype = session["krb_preauth_etype"] or "18"
         if preauth_cipher:
-            old_creds = session.credentials_list[preauth_idx]
-            old_creds.hash = f"$krb5pa${preauth_etype}${username}${realm}${preauth_cipher}"
-            old_creds.context["Realm"] = realm
-        session["krb_preauth_cred_idx"] = None
+            # Update AS-REQ hash in credentials_list with FQDN realm from AS-REP
+            updated_hash = f"$krb5pa${preauth_etype}${username}${realm}${preauth_cipher}"
+            session.credentials_list[cred_idx].hash = updated_hash
+            session.credentials_list[cred_idx].context["Realm"] = realm
 
     etype = getattr(layer, "etype", "23")
 
@@ -284,37 +291,46 @@ def _handle_as_rep(session: Session, layer: BaseLayer):
     creds.context["EType"] = etype
     creds.context["Type"] = "AS-REP Roasting"
 
-    logger.found(
-        session,
-        f"Kerberos AS-REP Roasting hash captured for {username}@{realm} "
-        f"(hashcat -m 18200):\n{hash_value}",
-    )
-    session.credentials_list.append(creds)
+    # Only output AS-REP Roasting hash if matching AS-REQ was seen (completed handshake)
+    if session["_krb_as_req_seen"]:
+        logger.found(
+            session,
+            f"Kerberos AS-REP Roasting hash captured for {username}@{realm} "
+            f"(hashcat -m 18200):\n{hash_value}",
+        )
+        session.credentials_list.append(creds)
 
 
 def _handle_tgs_req(session: Session, layer: BaseLayer):
     """
-    TGS-REQ — record the requested service name so TGS-REP can reference it.
+    TGS-REQ - record the requested service name and set flag so TGS-REP
+    can verify that a matching request was seen (completed handshake).
     """
     sname = getattr(layer, "SNameString", None) or getattr(layer, "snamestring", None)
     if sname:
         session["krb_sname"] = sname
         logger.info(session, f"Kerberos TGS-REQ for service: {sname}")
+        session["_krb_tgs_req_seen"] = True
 
 
 def _handle_tgs_rep(session: Session, layer: BaseLayer):
     """
-    TGS-REP — extract Ticket.enc-part cipher for Kerberoasting.
-
+    TGS-REP - extract Ticket.enc-part cipher for Kerberoasting.
+    
+    Only outputs hash if matching TGS-REQ was seen (completed handshake).
+    
     Stream order of kerberos.cipher in a TGS-REP packet:
-        [0]  Ticket.enc-part  (encrypted with service account NTLM — target)
-        [1]  KDC-REP.enc-part (encrypted with TGT session key — not useful)
-
+        [0]  Ticket.enc-part  (encrypted with service account NTLM - target)
+        [1]  KDC-REP.enc-part (encrypted with TGT session key - not useful)
+    
     SPN parts from kerberos.SNameString may be comma-separated; join with '/'.
-
+    
     Hash format: $krb5tgs$<etype>$*<user>$<REALM>$<service>*$<checksum>$<enc_data>
     (Hashcat mode 13100)
     """
+    # Only output if matching TGS-REQ was seen
+    if not session["_krb_tgs_req_seen"]:
+        return
     username = session["krb_username"] or getattr(layer, "CNameString", None)
     realm = getattr(layer, "crealm", None) or session["krb_realm"]
     sname = session["krb_sname"] or getattr(layer, "SNameString", None)
@@ -351,3 +367,6 @@ def _handle_tgs_rep(session: Session, layer: BaseLayer):
         f"(requested by {username}@{realm}) (hashcat -m 13100):\n{hash_value}",
     )
     session.credentials_list.append(creds)
+    
+    # Clear flag to prevent duplicate output if multiple TGS-REP packets arrive
+    session["_krb_tgs_req_seen"] = False
