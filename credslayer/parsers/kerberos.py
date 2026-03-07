@@ -74,10 +74,28 @@ def _get_all_ciphers(layer: BaseLayer):
     Return every kerberos.cipher value from *layer* as a list of plain hex
     strings (no colon separators), in the order tshark emits them (stream
     order).  Returns [] when no cipher field is present.
+    
+    Supports both tshark 4.4.x (generic 'cipher' field) and tshark 4.6.x+
+    (specific 'encryptedTicketData_cipher' and 'encryptedKDCREPData_cipher' fields).
     """
+    # Try old tshark 4.4.x field name first (generic 'cipher')
     cf = layer.get_field("cipher")
+    
+    # If not found, try tshark 4.6.x+ specific field names
     if cf is None:
-        return []
+        # Collect all cipher values from both Ticket and KDC-REP structures
+        ciphers = []
+        for field_name in ("encryptedTicketData_cipher", "encryptedKDCREPData_cipher", "pA_ENC_TIMESTAMP_cipher"):
+            field = layer.get_field(field_name)
+            if field:
+                try:
+                    fields = field.all_fields if hasattr(field, 'all_fields') else [field]
+                except AttributeError:
+                    fields = [field]
+                ciphers.extend([f.raw_value for f in fields if f is not None and f.raw_value])
+        return ciphers
+    
+    # Old path: generic 'cipher' field exists
     try:
         fields = cf.all_fields
     except AttributeError:
