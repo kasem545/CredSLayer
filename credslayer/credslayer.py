@@ -23,6 +23,9 @@ def build_argument_parser() -> ArgumentParser:
     parser.add_argument('-o', '--output',
                         help='output captured credentials to a file',
                         metavar='FILE')
+    parser.add_argument('-oH', '--output-hashes',
+                        help='output only hashes to a file (one hash per line, ready for hashcat)',
+                        metavar='FILE')
     parser.add_argument('-s', '--string-inspection',
                         choices=["enable", "disable"],
                         help='whether you want to look for interesting strings (email addresses, '
@@ -107,11 +110,16 @@ def main():
             logger.info("CredSLayer will decode traffic on '{}' as '{}'".format(*tokens))
 
     if args.output:
-
         if os.path.isfile(args.output):
             parser.error(args.output + " already exists")
-
         logger.OUTPUT_FILE = open(args.output, "w")
+    
+    # Hash-only output file
+    hash_output_file = None
+    if hasattr(args, 'output_hashes') and args.output_hashes:
+        if os.path.isfile(args.output_hashes):
+            parser.error(args.output_hashes + " already exists")
+        hash_output_file = open(args.output_hashes, "w")
 
     # Setup file extraction if requested
     file_extractor = None
@@ -153,14 +161,17 @@ def main():
                                   pcap_output=args.listen_output)
         exit(0)
 
+    # Collect all session managers for hash extraction
+    session_managers = []
+    
     for pcap in args.pcapfiles:
-
         try:
-            manager.process_pcap(pcap,
-                                 must_inspect_strings=string_inspection,
-                                 tshark_filter=ip_filter,
-                                 debug=args.debug,
-                                 decode_as=decode_map)
+            result = manager.process_pcap(pcap,
+                                          must_inspect_strings=string_inspection,
+                                          tshark_filter=ip_filter,
+                                          debug=args.debug,
+                                          decode_as=decode_map)
+            session_managers.append(result)
 
         except Exception as e:
             error_str = str(e)
@@ -179,6 +190,15 @@ def main():
     if file_extractor:
         print(file_extractor.get_summary())
 
+    # Write hash-only output if requested
+    if hash_output_file:
+        for mgr in session_managers:
+            for cred in mgr.get_list_of_all_credentials():
+                if cred.hash:
+                    hash_output_file.write(cred.hash + "\n")
+        hash_output_file.close()
+        logger.info(f"Hashes written to: {args.output_hashes}")
+    
     if logger.OUTPUT_FILE:
         logger.OUTPUT_FILE.close()
 
