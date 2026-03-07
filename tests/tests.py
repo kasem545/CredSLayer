@@ -704,5 +704,74 @@ class KerberosRealPcapKrb5v2Test(unittest.TestCase):
                 f'AP-REQ armor cipher leaked into hash for {c.username}: {c.hash[:60]}...',
             )
 
+
+class KerberosRealPcapWS01Test(unittest.TestCase):
+    """
+    Integration tests against the real-world Windows PktMon capture
+    (WS-01_PktMon.pcap).
+
+    Flow in the capture:
+      - AS-REQ (port 49738): no padata cipher — initial probe, no hash expected
+      - AS-REQ (port 49739): with PA-ENC-TIMESTAMP — pre-auth hash expected
+      - AS-REP (port 49739): CERTIFICATE.HTB realm — AS-REP roasting hash expected
+      - TGS-REQ/TGS-REP (ports 49740, 49741): two Kerberoasting hashes expected
+
+    Critically, the AS-REQ packets carry the short realm 'CERTIFICATE' while the
+    AS-REP/TGS-REP carry the FQDN 'CERTIFICATE.HTB'.  All four hashes must use
+    the FQDN realm.
+    """
+
+    def setUp(self):
+        abspath = os.path.abspath(__file__)
+        os.chdir(os.path.dirname(abspath))
+        self.credentials_list = process_pcap("samples/WS-01_PktMon.pcap").get_list_of_all_credentials()
+        self.krb_creds = [c for c in self.credentials_list if c.context.get("Type") in
+                          ("AS-REQ Pre-auth", "AS-REP Roasting", "Kerberoasting")]
+
+    def _find(self, hash_type):
+        return next((c for c in self.krb_creds if c.context.get("Type") == hash_type), None)
+
+    def test_as_req_preauth_fqdn_realm(self):
+        """AS-REQ Pre-auth hash uses FQDN realm CERTIFICATE.HTB, not short CERTIFICATE."""
+        creds = self._find("AS-REQ Pre-auth")
+        self.assertIsNotNone(creds, "AS-REQ Pre-auth hash not found")
+        self.assertEqual(creds.username, "Lion.SK")
+        self.assertTrue(creds.hash.startswith("$krb5pa$"))
+        self.assertIn("Lion.SK", creds.hash)
+        self.assertIn("CERTIFICATE.HTB", creds.hash,
+                      "Short realm CERTIFICATE used instead of FQDN CERTIFICATE.HTB")
+        self.assertNotIn("$Lion.SK$CERTIFICATE$", creds.hash,
+                         "Hash still contains short realm CERTIFICATE")
+        self.assertEqual(creds.context["Realm"], "CERTIFICATE.HTB")
+        self.assertEqual(creds.context["Type"], "AS-REQ Pre-auth")
+
+    def test_as_rep_roasting_fqdn_realm(self):
+        """AS-REP Roasting hash uses FQDN realm CERTIFICATE.HTB."""
+        creds = self._find("AS-REP Roasting")
+        self.assertIsNotNone(creds, "AS-REP Roasting hash not found")
+        self.assertEqual(creds.username, "Lion.SK")
+        self.assertTrue(creds.hash.startswith("$krb5asrep$"))
+        self.assertIn("Lion.SK@CERTIFICATE.HTB", creds.hash,
+                      "Short realm CERTIFICATE.HTB missing in AS-REP roasting hash")
+        self.assertIn(":", creds.hash)   # checksum:enc_data separator
+        self.assertEqual(creds.context["Realm"], "CERTIFICATE.HTB")
+        self.assertEqual(creds.context["Type"], "AS-REP Roasting")
+
+    def test_kerberoasting_hashes_count_and_realm(self):
+        """Two Kerberoasting hashes extracted, both with FQDN realm."""
+        tgs_creds = [c for c in self.krb_creds if c.context.get("Type") == "Kerberoasting"]
+        self.assertEqual(len(tgs_creds), 2, "Expected 2 Kerberoasting hashes")
+        for c in tgs_creds:
+            self.assertTrue(c.hash.startswith("$krb5tgs$"))
+            self.assertIn("CERTIFICATE.HTB", c.hash)
+            self.assertEqual(c.context["Realm"], "CERTIFICATE.HTB")
+
+    def test_total_hash_count(self):
+        """Exactly 4 Kerberos hashes found: 1 pre-auth + 1 AS-REP + 2 TGS."""
+        self.assertEqual(len(self.krb_creds), 4,
+                         f"Expected 4 Kerberos hashes, got {len(self.krb_creds)}: "
+                         f"{[c.context.get('Type') for c in self.krb_creds]}")
+
+
 if __name__ == '__main__':
     unittest.main()

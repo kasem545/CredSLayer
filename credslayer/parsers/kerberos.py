@@ -154,6 +154,13 @@ def _handle_as_req(session: Session, layer: BaseLayer, is_compound: bool = False
     When padata is present (pre-auth enforced), kerberos.cipher carries the
     PA-ENC-TIMESTAMP blob encrypted with the user's password.  This yields a
     $krb5pa$ hash crackable offline (Hashcat mode 19900).
+
+    The realm in the AS-REQ packet is often a short/NetBIOS name (e.g.
+    'CERTIFICATE') while the fully-qualified domain name ('CERTIFICATE.HTB') is
+    only present in the AS-REP's crealm field.  We emit the hash immediately
+    (so AS-REQ-only captures still produce output) and record the credential
+    list index so _handle_as_rep can correct the realm in-place once the FQDN
+    becomes known.
     """
     username = getattr(layer, "CNameString", None)
     realm = getattr(layer, "realm", None)
@@ -178,6 +185,10 @@ def _handle_as_req(session: Session, layer: BaseLayer, is_compound: bool = False
     etype = getattr(layer, "etype", "18")
     cipher_hex = ciphers[0]
 
+    # Store cipher+etype so _handle_as_rep can re-emit with the FQDN realm.
+    session["krb_preauth_cipher"] = cipher_hex
+    session["krb_preauth_etype"] = etype
+
     hash_value = f"$krb5pa${etype}${username}${realm}${cipher_hex}"
 
     creds = Credentials()
@@ -193,6 +204,8 @@ def _handle_as_req(session: Session, layer: BaseLayer, is_compound: bool = False
         f"(hashcat -m 19900)",
     )
     session.credentials_list.append(creds)
+    # Record index for in-place realm correction when AS-REP arrives.
+    session["krb_preauth_cred_idx"] = len(session.credentials_list) - 1
 
 
 def _handle_as_rep(session: Session, layer: BaseLayer):
@@ -205,9 +218,35 @@ def _handle_as_rep(session: Session, layer: BaseLayer):
 
     Hash format: $krb5asrep$<etype>$<user>@<REALM>:<checksum>$<enc_data>
     (Hashcat mode 18200)
+
+    The AS-REP always carries the FQDN in crealm.  We prefer that over the
+    short realm stored during AS-REQ processing, and back-patch the AS-REQ
+    pre-auth credential emitted earlier so both hashes use the correct domain.
     """
     username = session["krb_username"] or getattr(layer, "CNameString", None)
-    realm = session["krb_realm"] or getattr(layer, "crealm", None)
+    # crealm / realm in AS-REP is always the FQDN.  Prefer it over the
+    # potentially short realm recorded during AS-REQ processing.
+    realm = (
+        getattr(layer, "crealm", None)
+        or getattr(layer, "realm", None)
+        or session["krb_realm"]
+    )
+
+    # Update session realm to FQDN for subsequent TGS-REQ/REP packets.
+    if realm:
+        session["krb_realm"] = realm
+
+    # Back-patch the AS-REQ Pre-auth hash emitted earlier with the FQDN realm.
+    preauth_idx = session["krb_preauth_cred_idx"]
+    if preauth_idx is not None and username and realm:
+        preauth_cipher = session["krb_preauth_cipher"]
+        preauth_etype = session["krb_preauth_etype"] or "18"
+        if preauth_cipher:
+            old_creds = session.credentials_list[preauth_idx]
+            old_creds.hash = f"$krb5pa${preauth_etype}${username}${realm}${preauth_cipher}"
+            old_creds.context["Realm"] = realm
+        session["krb_preauth_cred_idx"] = None
+
     etype = getattr(layer, "etype", "23")
 
     ciphers = _get_all_ciphers(layer)
