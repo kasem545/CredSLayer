@@ -1,36 +1,48 @@
 # coding: utf-8
 
 """
-Kerberos (RFC 4120) parser for extracting authentication artefacts.
+Kerberos (RFC 4120) parser — cipher extraction modelled after roasting.py
+(MIT License, Javier Álvarez, 2024).
 
-Captures three classes of interesting material:
+Three hash classes are captured:
 
-1. AS-REQ (msg_type=10)
-   Reveals the requesting principal name and realm — useful for user
-   enumeration even when pre-authentication is required.
+1. AS-REQ Pre-auth (msg_type=10, PA-ENC-TIMESTAMP)
+   When a KDC enforces pre-authentication the client encrypts a timestamp with
+   its password-derived key.  The cipher can be cracked offline.
+   Hash format (Hashcat mode 19900):
+       $krb5pa$<etype>$<username>$<REALM>$<cipher-hex>
 
 2. AS-REP Roasting (msg_type=11)
-   When an account has "Do not require Kerberos pre-authentication" set,
-   the KDC returns an AS-REP whose enc-part is encrypted with the user's
-   password-derived key.  This encrypted blob can be cracked offline.
+   When an account has "Do not require Kerberos pre-authentication" the KDC
+   returns an AS-REP whose enc-part is encrypted with the user's password.
+   Two kerberos.cipher values appear in each AS-REP packet (in stream order):
+       [0] Ticket.enc-part   — encrypted with the KDC's key (not crackable)
+       [1] KDC-REP.enc-part  — encrypted with the user's password  ← roasting target
    Hash format (Hashcat mode 18200):
-       $krb5asrep$<etype>$<username>@<REALM>:<cipher-hex>
+       $krb5asrep$<etype>$<username>@<REALM>:<checksum>$<enc-data>
+   where <checksum> = first 16 bytes (32 hex chars) of the KDC-REP.enc-part cipher.
 
 3. Kerberoasting (msg_type=13, TGS-REP)
-   Service tickets in TGS-REP are encrypted with the service account's
-   NTLM hash.  Any authenticated user can request them, and the ticket
-   can be cracked offline to recover the service account's password.
+   Service tickets are encrypted with the service account's NTLM hash.
+   Two kerberos.cipher values appear in each TGS-REP packet (in stream order):
+       [0] Ticket.enc-part   — encrypted with the service account's NTLM hash ← target
+       [1] KDC-REP.enc-part  — encrypted with the TGT session key (not crackable)
    Hash format (Hashcat mode 13100):
-       $krb5tgs$<etype>$*<username>$<REALM>$<service>*$<cipher-hex>
+       $krb5tgs$<etype>$*<username>$<REALM>$<service>*$<checksum>$<enc-data>
+   where <checksum> = first 16 bytes (32 hex chars) of the ticket cipher.
 
-tshark field → layer attribute mapping (pyshark XML mode, prefix stripped):
+pyshark field → layer attribute mapping (XML/JSON mode, kerberos. prefix stripped):
   kerberos.msg_type    → layer.msg_type
-  kerberos.realm       → layer.realm      (AS-REQ, TGS-REQ only)
-  kerberos.crealm      → layer.crealm     (AS-REP, TGS-REP only)
+  kerberos.realm       → layer.realm      (AS-REQ realm)
+  kerberos.crealm      → layer.crealm     (AS-REP / TGS-REP client realm)
   kerberos.CNameString → layer.CNameString (requesting principal)
-  kerberos.SNameString → layer.SNameString (service name, TGS-REQ only)
+  kerberos.SNameString → layer.SNameString (service name, TGS-REQ/REP)
   kerberos.etype       → layer.etype
-  kerberos.cipher      → layer.cipher  (colon-separated hex bytes)
+  kerberos.cipher      → layer.cipher  (hex, colon-separated per byte)
+
+Multiple kerberos.cipher / kerberos.etype values are accessed via
+layer.get_field('cipher').all_fields, preserving stream order so that
+index [0] is always the Ticket cipher and index [-1] is the KDC-REP enc-part.
 
 Session state:
   session["krb_username"] : client principal from AS-REQ / AS-REP
@@ -49,6 +61,40 @@ _AS_REQ = "10"
 _AS_REP = "11"
 _TGS_REQ = "12"
 _TGS_REP = "13"
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_all_ciphers(layer: BaseLayer):
+    """
+    Return every kerberos.cipher value from *layer* as a list of plain hex
+    strings (no colon separators), in the order tshark emits them (stream
+    order).  Returns [] when no cipher field is present.
+    """
+    cf = layer.get_field("cipher")
+    if cf is None:
+        return []
+    try:
+        fields = cf.all_fields
+    except AttributeError:
+        fields = [cf]
+    return [f.raw_value for f in fields if f is not None and f.raw_value]
+
+
+def _split_cipher(cipher_hex: str):
+    """
+    Split a cipher hex string into (checksum, enc_data) at the 16-byte
+    (32 hex char) boundary, matching Hashcat's expected input format.
+    """
+    return cipher_hex[:32], cipher_hex[32:]
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
 
 
 def analyse(session: Session, layer: BaseLayer) -> bool:
@@ -81,7 +127,11 @@ def analyse(session: Session, layer: BaseLayer) -> bool:
 
 def _handle_as_req(session: Session, layer: BaseLayer):
     """
-    AS-REQ — record requesting principal for later use and user enumeration.
+    AS-REQ — record requesting principal and extract PA-ENC-TIMESTAMP cipher.
+
+    When padata is present (pre-auth enforced), kerberos.cipher carries the
+    PA-ENC-TIMESTAMP blob encrypted with the user's password.  This yields a
+    $krb5pa$ hash crackable offline (Hashcat mode 19900).
     """
     username = getattr(layer, "CNameString", None)
     realm = getattr(layer, "realm", None)
@@ -91,25 +141,55 @@ def _handle_as_req(session: Session, layer: BaseLayer):
         session["krb_realm"] = realm
         logger.info(session, f"Kerberos AS-REQ: {username}@{realm}")
 
+    # PA-ENC-TIMESTAMP cipher is the only cipher in an AS-REQ packet
+    ciphers = _get_all_ciphers(layer)
+    if not (username and ciphers):
+        return
+
+    etype = getattr(layer, "etype", "18")
+    cipher_hex = ciphers[0]
+
+    hash_value = f"$krb5pa${etype}${username}${realm}${cipher_hex}"
+
+    creds = Credentials()
+    creds.username = username
+    creds.hash = hash_value
+    creds.context["Realm"] = realm
+    creds.context["EType"] = etype
+    creds.context["Type"] = "AS-REQ Pre-auth"
+
+    logger.found(
+        session,
+        f"Kerberos AS-REQ Pre-auth hash captured for {username}@{realm} "
+        f"(hashcat -m 19900)",
+    )
+    session.credentials_list.append(creds)
+
 
 def _handle_as_rep(session: Session, layer: BaseLayer):
     """
-    AS-REP — extract encrypted blob for AS-REP Roasting.
+    AS-REP — extract KDC-REP.enc-part cipher for AS-REP Roasting.
 
-    The enc-part cipher is encrypted with the user's password-derived key.
-    Capture it so the analyst can attempt offline cracking with hashcat
-    (mode 18200).
+    Stream order of kerberos.cipher in an AS-REP packet:
+        [0]  Ticket.enc-part  (encrypted with KDC key — not useful)
+        [-1] KDC-REP.enc-part (encrypted with user's password — roasting target)
+
+    Hash format: $krb5asrep$<etype>$<user>@<REALM>:<checksum>$<enc_data>
+    (Hashcat mode 18200)
     """
     username = session["krb_username"] or getattr(layer, "CNameString", None)
     realm = session["krb_realm"] or getattr(layer, "crealm", None)
-    etype = getattr(layer, "etype", "23")  # default to RC4 if unknown
-    cipher = getattr(layer, "cipher", None)
+    etype = getattr(layer, "etype", "23")
 
-    if not (username and cipher):
+    ciphers = _get_all_ciphers(layer)
+    if not (username and ciphers):
         return
 
-    cipher_hex = cipher.replace(":", "")
-    hash_value = "$krb5asrep${}${}@{}:{}".format(etype, username, realm, cipher_hex)
+    # Last cipher = KDC-REP.enc-part = encrypted with user's password key
+    cipher_hex = ciphers[-1]
+    checksum, enc_data = _split_cipher(cipher_hex)
+
+    hash_value = f"$krb5asrep${etype}${username}@{realm}:{checksum}${enc_data}"
 
     creds = Credentials()
     creds.username = username
@@ -138,27 +218,37 @@ def _handle_tgs_req(session: Session, layer: BaseLayer):
 
 def _handle_tgs_rep(session: Session, layer: BaseLayer):
     """
-    TGS-REP — extract service ticket for Kerberoasting.
+    TGS-REP — extract Ticket.enc-part cipher for Kerberoasting.
 
-    The ticket's enc-part is encrypted with the service account's NTLM hash.
-    Any authenticated domain user can request these tickets.  Capture the
-    cipher so the analyst can attempt offline cracking with hashcat
-    (mode 13100).
+    Stream order of kerberos.cipher in a TGS-REP packet:
+        [0]  Ticket.enc-part  (encrypted with service account NTLM — target)
+        [1]  KDC-REP.enc-part (encrypted with TGT session key — not useful)
+
+    SPN parts from kerberos.SNameString may be comma-separated; join with '/'.
+
+    Hash format: $krb5tgs$<etype>$*<user>$<REALM>$<service>*$<checksum>$<enc_data>
+    (Hashcat mode 13100)
     """
     username = session["krb_username"] or getattr(layer, "CNameString", None)
     realm = getattr(layer, "crealm", None) or session["krb_realm"]
     sname = session["krb_sname"] or getattr(layer, "SNameString", None)
     etype = getattr(layer, "etype", "23")
-    cipher = getattr(layer, "cipher", None)
 
-    if not cipher:
+    ciphers = _get_all_ciphers(layer)
+    if not ciphers:
         return
 
-    cipher_hex = cipher.replace(":", "")
-    svc_label = sname or "unknown"
+    # First cipher = Ticket.enc-part = encrypted with service account's NTLM hash
+    cipher_hex = ciphers[0]
+    checksum, enc_data = _split_cipher(cipher_hex)
 
-    hash_value = "$krb5tgs${}$*{}${}${}*${}".format(
-        etype, username or "unknown", realm or "unknown", svc_label, cipher_hex
+    # Normalise SPN: tshark emits multi-component names comma-separated
+    svc_label = (sname or "unknown").replace(",", "/")
+
+    hash_value = (
+        f"$krb5tgs${etype}$*{username or 'unknown'}"
+        f"${realm or 'unknown'}${svc_label}*"
+        f"${checksum}${enc_data}"
     )
 
     creds = Credentials()

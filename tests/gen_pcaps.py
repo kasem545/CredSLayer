@@ -309,18 +309,27 @@ def _krb_helpers():
     return h
 
 
-def _build_ticket(h, realm, sname_names, etype=23):
-    """Build minimal Ticket (APPLICATION 1 = 0x61) for embedding in KDC-REP."""
-    tkt_enc = h.seq(h.ctx(0, h.integer(etype)), h.ctx(2, h.octet_string(b"\x00" * 8)))
-    sname = h.principal_name(2, sname_names)
-    ticket_inner = h.seq(
-        h.ctx(0, h.integer(5)),          # tkt-vno [0]
-        h.ctx(1, h.gen_string(realm)),    # realm [1]
-        h.ctx(2, sname),                  # sname [2]
-        h.ctx(3, tkt_enc),                # enc-part [3]
+def _build_ticket(h, realm, sname_names, cipher_bytes, etype=23):
+    """
+    Build a Ticket (APPLICATION 1 = 0x61) per RFC 4120 §5.3.
+
+    APPLICATION 1 wraps a SEQUENCE directly (no extra SEQUENCE layer).
+    The ticket's enc-part cipher is what Kerberoasting cracks.
+    """
+    tkt_enc = h.seq(
+        h.ctx(0, h.integer(etype)),
+        h.ctx(2, h.octet_string(cipher_bytes)),
     )
-    ticket_body = h.seq(ticket_inner)
-    return bytes([0x61]) + h.der_len(len(ticket_body)) + ticket_body
+    sname = h.principal_name(2, sname_names)
+    # APPLICATION 1 { SEQUENCE { [0] tkt-vno, [1] realm, [2] sname, [3] enc-part } }
+    ticket_seq = h.seq(
+        h.ctx(0, h.integer(5)),           # tkt-vno [0]
+        h.ctx(1, h.gen_string(realm)),     # realm [1]
+        h.ctx(2, sname),                   # sname [2]
+        h.ctx(3, tkt_enc),                 # enc-part [3]
+    )
+    # APPLICATION 1 tag wraps the SEQUENCE directly — no extra wrapper
+    return bytes([0x61]) + h.der_len(len(ticket_seq)) + ticket_seq
 
 
 # ---------------------------------------------------------------------------
@@ -363,12 +372,17 @@ def gen_kerberos_as_req_rep():
     )
 
     # -- AS-REP (APPLICATION 11 = 0x6B) -------------------------------------
-    cipher_bytes = bytes.fromhex("deadbeefcafebabe12345678")
-    ticket = _build_ticket(h, "CORP.LOCAL", ["krbtgt", "CORP.LOCAL"])
-
+    # Two kerberos.cipher fields appear in the packet:
+    #   [0] Ticket.enc-part cipher  (encrypted with KDC's key — NOT crackable by client)
+    #   [1] KDC-REP.enc-part cipher (encrypted with user's password — AS-REP roasting target)
+    # roasting.py uses cipher_parts[-1] (last), so the roasting hash goes in KDC-REP.enc-part.
+    ticket = _build_ticket(h, "CORP.LOCAL", ["krbtgt", "CORP.LOCAL"],
+                           cipher_bytes=b"\x00" * 20)  # dummy; KDC key, not crackable
+    # KDC-REP.enc-part: crackable with the user's password-derived key
+    asrep_cipher = bytes.fromhex("deadbeefcafebabe12345678aabbccdd001122334455")
     enc_part = h.ctx(6, h.seq(
         h.ctx(0, h.integer(23)),
-        h.ctx(2, h.octet_string(cipher_bytes)),
+        h.ctx(2, h.octet_string(asrep_cipher)),
     ))
 
     as_rep_seq = h.seq(
@@ -394,14 +408,15 @@ def gen_kerberos_as_req_rep():
 # ---------------------------------------------------------------------------
 # Kerberos – TGS-REQ + TGS-REP (Kerberoasting)   (UDP port 88)
 #   requestor: jdoe@CORP.LOCAL  /  service: MSSQLSvc/db.corp.local:1433
-#   cipher: aabbccddeeff001122334455
+#   ticket.enc-part cipher (Kerberoasting target): aabbccddeeff001122334455
 # ---------------------------------------------------------------------------
 def gen_kerberos_tgs_req_rep():
     """
     RFC 4120 compliant TGS-REQ (msg_type=12) + TGS-REP (msg_type=13).
 
-    TGS-REQ-BODY: same as AS-REQ-BODY but cname omitted, sname = service.
-    TGS-REP: same KDC-REP structure, enc-part is service ticket cipher.
+    For Kerberoasting: the crackable cipher is in Ticket.enc-part, encrypted
+    with the service account's NTLM hash. KDC-REP.enc-part is encrypted with
+    the user's session key and is NOT the Kerberoasting target.
     """
     h = _krb_helpers()
 
@@ -427,15 +442,16 @@ def gen_kerberos_tgs_req_rep():
         / Raw(load=tgs_req_der)
     )
 
-    # -- TGS-REP (APPLICATION 13 = 0x6D) ------------------------------------
-    cipher_bytes = bytes.fromhex("aabbccddeeff001122334455")
-    ticket_tgs = _build_ticket(h, "CORP.LOCAL", ["MSSQLSvc/db.corp.local:1433"])
-
+    # Ticket.enc-part cipher = kerberoasting target (encrypted with service account NTLM hash)
+    # roasting.py uses cipher_parts[0] (first), which is Ticket.enc-part.
+    ticket_cipher = bytes.fromhex("aabbccddeeff001122334455667788ff001122334455")
+    ticket_tgs = _build_ticket(h, "CORP.LOCAL", ["MSSQLSvc/db.corp.local:1433"],
+                               cipher_bytes=ticket_cipher)
+    # KDC-REP.enc-part: session key encrypted with TGT session key — NOT the cracking target
     enc_part = h.ctx(6, h.seq(
-        h.ctx(0, h.integer(23)),
-        h.ctx(2, h.octet_string(cipher_bytes)),
+        h.ctx(0, h.integer(17)),           # etype 17 = aes128 (session key)
+        h.ctx(2, h.octet_string(b"\x00" * 20)),
     ))
-
     tgs_rep_seq = h.seq(
         h.ctx(0, h.integer(5)),                                       # pvno [0]
         h.ctx(1, h.integer(13)),                                      # msg-type [1]
@@ -457,6 +473,67 @@ def gen_kerberos_tgs_req_rep():
 
 
 # ---------------------------------------------------------------------------
+# Kerberos – AS-REQ with PA-ENC-TIMESTAMP (pre-auth)   (UDP port 88)
+#   principal: jdoe@CORP.LOCAL  /  padata cipher: aabbccddeeff001122334455
+#   Hash format (Hashcat -m 19900): $krb5pa$18$<user>$<realm>$<cipher>
+# ---------------------------------------------------------------------------
+def gen_kerberos_as_req_preauth():
+    """
+    AS-REQ (msg_type=10) with PA-ENC-TIMESTAMP padata.
+
+    PA-ENC-TIMESTAMP (padata-type=2) contains an EncryptedData whose cipher
+    is the offline-cracking target for pre-authentication brute-forcing.
+    roasting.py extracts it as: $krb5pa$18$<user>$<realm>$<cipher>
+    """
+    h = _krb_helpers()
+
+    pa_cipher = bytes.fromhex("aabbccddeeff001122334455667788ff001122334455")
+
+    # EncryptedData for the PA-ENC-TIMESTAMP
+    enc_ts = h.seq(
+        h.ctx(0, h.integer(18)),                  # etype=18 (AES256)
+        h.ctx(2, h.octet_string(pa_cipher)),      # cipher
+    )
+
+    # PA-DATA SEQUENCE { padata-type [1], padata-value [2] }
+    # padata-value is an OCTET STRING wrapping the DER-encoded EncryptedData
+    pa_data_entry = h.seq(
+        h.ctx(1, h.integer(2)),                   # padata-type=2 (PA-ENC-TIMESTAMP)
+        h.ctx(2, h.octet_string(enc_ts)),         # padata-value
+    )
+    padata = h.ctx(3, h.seq(pa_data_entry))      # padata [3] SEQUENCE OF PA-DATA
+
+    # KDC-REQ-BODY
+    kdc_opts = h.ctx(0, h.bit_string(bytes([0x00, 0x00, 0x00, 0x00])))
+    cname    = h.ctx(1, h.principal_name(1, ["jdoe"]))
+    realm    = h.ctx(2, h.gen_string("CORP.LOCAL"))
+    sname    = h.ctx(3, h.principal_name(2, ["krbtgt", "CORP.LOCAL"]))
+    till     = h.ctx(5, h.generalizedtime("19700101000000Z"))
+    nonce    = h.ctx(7, h.integer(99999))
+    etype    = h.ctx(8, h.seq(h.integer(18)))
+
+    req_body_inner = h.seq(kdc_opts, cname, realm, sname, till, nonce, etype)
+    req_body       = h.ctx(4, req_body_inner)
+
+    # AS-REQ with padata
+    as_req_seq = h.seq(
+        h.ctx(1, h.integer(5)),
+        h.ctx(2, h.integer(10)),
+        padata,
+        req_body,
+    )
+    as_req_der = bytes([0x6A]) + h.der_len(len(as_req_seq)) + as_req_seq
+
+    as_req_pkt = (
+        Ether(src=CLIENT_MAC, dst=SERVER_MAC)
+        / IP(src=CLIENT_IP, dst=SERVER_IP)
+        / UDP(sport=54090, dport=88)
+        / Raw(load=as_req_der)
+    )
+
+    save("kerberos-as-req-preauth.pcap", [as_req_pkt])
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
@@ -468,4 +545,5 @@ if __name__ == "__main__":
     gen_smtp_cram_md5()
     gen_kerberos_as_req_rep()
     gen_kerberos_tgs_req_rep()
+    gen_kerberos_as_req_preauth()
     print("Done.")

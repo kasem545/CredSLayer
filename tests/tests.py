@@ -435,7 +435,9 @@ class KerberosIntegrationTest(unittest.TestCase):
     def test_as_rep_roasting(self):
         """
         AS-REQ + AS-REP: jdoe@CORP.LOCAL AS-REP Roasting hash extracted.
-        Hash format: $krb5asrep$<etype>$<username>@<REALM>:<cipher-hex>
+        Hash format: $krb5asrep$<etype>$<username>@<REALM>:<checksum>$<enc_data>
+        Cipher is from KDC-REP.enc-part (ciphers[-1] in stream order).
+        checksum = first 16 bytes (32 hex chars), enc_data = remainder.
         """
         credentials_list = process_pcap("samples/kerberos-as-req-rep.pcap").get_list_of_all_credentials()
         self.assertEqual(len(credentials_list), 1)
@@ -444,13 +446,18 @@ class KerberosIntegrationTest(unittest.TestCase):
         self.assertTrue(creds.hash.startswith('$krb5asrep$'))
         self.assertIn('jdoe', creds.hash)
         self.assertIn('CORP.LOCAL', creds.hash)
-        self.assertIn('deadbeefcafebabe12345678', creds.hash)
+        # cipher hex = deadbeefcafebabe12345678aabbccdd001122334455
+        # checksum   = deadbeefcafebabe12345678aabbccdd  (first 32 hex chars)
+        # enc_data   = 001122334455
+        self.assertIn('deadbeefcafebabe12345678', creds.hash)   # substring of checksum
+        self.assertIn('001122334455', creds.hash)               # enc_data
         self.assertEqual(creds.context.get('Type'), 'AS-REP Roasting')
 
     def test_tgs_rep_kerberoasting(self):
         """
         TGS-REQ + TGS-REP: Kerberoasting hash for MSSQLSvc service extracted.
-        Hash format: $krb5tgs$<etype>$*<username>$<REALM>$<service>*$<cipher-hex>
+        Hash format: $krb5tgs$<etype>$*<username>$<REALM>$<service>*$<checksum>$<enc_data>
+        Cipher is from Ticket.enc-part (ciphers[0] in stream order).
         """
         credentials_list = process_pcap("samples/kerberos-tgs-req-rep.pcap").get_list_of_all_credentials()
         self.assertEqual(len(credentials_list), 1)
@@ -458,9 +465,29 @@ class KerberosIntegrationTest(unittest.TestCase):
         self.assertTrue(creds.hash.startswith('$krb5tgs$'))
         self.assertIn('MSSQLSvc/db.corp.local:1433', creds.hash)
         self.assertIn('CORP.LOCAL', creds.hash)
-        self.assertIn('aabbccddeeff001122334455', creds.hash)
+        # cipher hex = aabbccddeeff001122334455667788ff001122334455
+        # checksum   = aabbccddeeff001122334455667788ff  (first 32 hex chars)
+        # enc_data   = 001122334455
+        self.assertIn('aabbccddeeff001122334455', creds.hash)  # substring of checksum
+        self.assertIn('001122334455', creds.hash)              # enc_data
         self.assertEqual(creds.context.get('Type'), 'Kerberoasting')
 
+    def test_as_req_preauth(self):
+        """
+        AS-REQ with PA-ENC-TIMESTAMP: pre-auth hash extracted.
+        Hash format: $krb5pa$<etype>$<username>$<REALM>$<cipher>
+        (Hashcat mode 19900)
+        """
+        credentials_list = process_pcap("samples/kerberos-as-req-preauth.pcap").get_list_of_all_credentials()
+        self.assertEqual(len(credentials_list), 1)
+        creds = credentials_list[0]
+        self.assertEqual(creds.username, 'jdoe')
+        self.assertTrue(creds.hash.startswith('$krb5pa$'))
+        self.assertIn('18', creds.hash)                             # etype AES256
+        self.assertIn('jdoe', creds.hash)
+        self.assertIn('CORP.LOCAL', creds.hash)
+        self.assertIn('aabbccddeeff001122334455', creds.hash)       # substring of cipher
+        self.assertEqual(creds.context.get('Type'), 'AS-REQ Pre-auth')
 
 if __name__ == '__main__':
     unittest.main()
