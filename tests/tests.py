@@ -489,5 +489,205 @@ class KerberosIntegrationTest(unittest.TestCase):
         self.assertIn('aabbccddeeff001122334455', creds.hash)       # substring of cipher
         self.assertEqual(creds.context.get('Type'), 'AS-REQ Pre-auth')
 
+
+
+class KerberosRealPcapKrb5Test(unittest.TestCase):
+    """
+    Integration tests against the real-world Samba KDC capture (krb5.pcap).
+
+    The capture contains three principals in SAMBA.EXAMPLE.COM:
+      - LOCALDC$       : AS-REQ Pre-auth + AS-REP Roasting
+      - Administrator  : AS-REQ Pre-auth + AS-REP Roasting + Kerberoasting (ldap SPN)
+      - LOCALADMEMBER$ : AS-REQ Pre-auth + AS-REP Roasting + Kerberoasting (ldap SPN)
+    """
+
+    def setUp(self):
+        abspath = os.path.abspath(__file__)
+        os.chdir(os.path.dirname(abspath))
+        self.credentials_list = process_pcap('samples/krb5.pcap').get_list_of_all_credentials()
+        self.krb_creds = [c for c in self.credentials_list if c.context.get('Type') in
+                          ('AS-REQ Pre-auth', 'AS-REP Roasting', 'Kerberoasting')]
+
+    def _find(self, username, hash_type):
+        """Return the first credential matching (username, hash_type), or None."""
+        for c in self.krb_creds:
+            if c.username == username and c.context.get('Type') == hash_type:
+                return c
+        return None
+
+    # ------------------------------------------------------------------
+    # LOCALDC$ principal
+    # ------------------------------------------------------------------
+
+    def test_localdc_as_req_preauth(self):
+        """LOCALDC$ AS-REQ Pre-auth hash extracted with correct format."""
+        creds = self._find('LOCALDC$', 'AS-REQ Pre-auth')
+        self.assertIsNotNone(creds, 'LOCALDC$ AS-REQ Pre-auth not found')
+        self.assertTrue(creds.hash.startswith('$krb5pa$'),
+                        f'Unexpected hash prefix: {creds.hash[:20]}')
+        self.assertIn('LOCALDC$', creds.hash)
+        self.assertIn('SAMBA.EXAMPLE.COM', creds.hash)
+        self.assertEqual(creds.context['Realm'], 'SAMBA.EXAMPLE.COM')
+        self.assertEqual(creds.context['Type'], 'AS-REQ Pre-auth')
+
+    def test_localdc_as_rep_roasting(self):
+        """LOCALDC$ AS-REP Roasting hash extracted with correct format."""
+        creds = self._find('LOCALDC$', 'AS-REP Roasting')
+        self.assertIsNotNone(creds, 'LOCALDC$ AS-REP Roasting not found')
+        self.assertTrue(creds.hash.startswith('$krb5asrep$'),
+                        f'Unexpected hash prefix: {creds.hash[:20]}')
+        self.assertIn('LOCALDC$@SAMBA.EXAMPLE.COM', creds.hash)
+        self.assertEqual(creds.context['Type'], 'AS-REP Roasting')
+        # checksum:enc_data separator must be present
+        self.assertIn(':', creds.hash[creds.hash.index('$', 11):])
+
+    # ------------------------------------------------------------------
+    # Administrator principal
+    # ------------------------------------------------------------------
+
+    def test_administrator_as_req_preauth(self):
+        """Administrator AS-REQ Pre-auth hash extracted."""
+        creds = self._find('Administrator', 'AS-REQ Pre-auth')
+        self.assertIsNotNone(creds, 'Administrator AS-REQ Pre-auth not found')
+        self.assertTrue(creds.hash.startswith('$krb5pa$'))
+        self.assertIn('Administrator', creds.hash)
+        self.assertIn('SAMBA.EXAMPLE.COM', creds.hash)
+
+    def test_administrator_as_rep_roasting(self):
+        """Administrator AS-REP Roasting hash extracted."""
+        creds = self._find('Administrator', 'AS-REP Roasting')
+        self.assertIsNotNone(creds, 'Administrator AS-REP Roasting not found')
+        self.assertTrue(creds.hash.startswith('$krb5asrep$'))
+        self.assertIn('Administrator@SAMBA.EXAMPLE.COM', creds.hash)
+
+    def test_administrator_kerberoasting(self):
+        """Administrator Kerberoasting hash extracted (krbtgt SPN in this capture)."""
+        creds = self._find('Administrator', 'Kerberoasting')
+        self.assertIsNotNone(creds, 'Administrator Kerberoasting not found')
+        self.assertTrue(creds.hash.startswith('$krb5tgs$'),
+                        f'Unexpected hash prefix: {creds.hash[:20]}')
+        self.assertIn('Administrator', creds.hash)
+        self.assertIn('SAMBA.EXAMPLE.COM', creds.hash)
+        self.assertEqual(creds.context['Type'], 'Kerberoasting')
+        # hash must contain $<checksum>$<enc_data> section
+        self.assertGreater(creds.hash.count('$'), 4)
+
+    # ------------------------------------------------------------------
+    # LOCALADMEMBER$ principal
+    # ------------------------------------------------------------------
+
+    def test_localadmember_as_req_preauth(self):
+        """LOCALADMEMBER$ AS-REQ Pre-auth hash extracted."""
+        creds = self._find('LOCALADMEMBER$', 'AS-REQ Pre-auth')
+        self.assertIsNotNone(creds, 'LOCALADMEMBER$ AS-REQ Pre-auth not found')
+        self.assertTrue(creds.hash.startswith('$krb5pa$'))
+        self.assertIn('LOCALADMEMBER$', creds.hash)
+        self.assertIn('SAMBA.EXAMPLE.COM', creds.hash)
+
+    def test_localadmember_as_rep_roasting(self):
+        """LOCALADMEMBER$ AS-REP Roasting hash extracted."""
+        creds = self._find('LOCALADMEMBER$', 'AS-REP Roasting')
+        self.assertIsNotNone(creds, 'LOCALADMEMBER$ AS-REP Roasting not found')
+        self.assertTrue(creds.hash.startswith('$krb5asrep$'))
+        self.assertIn('LOCALADMEMBER$@SAMBA.EXAMPLE.COM', creds.hash)
+
+    def test_localadmember_kerberoasting(self):
+        """LOCALADMEMBER$ Kerberoasting hash extracted."""
+        creds = self._find('LOCALADMEMBER$', 'Kerberoasting')
+        self.assertIsNotNone(creds, 'LOCALADMEMBER$ Kerberoasting not found')
+        self.assertTrue(creds.hash.startswith('$krb5tgs$'))
+        self.assertIn('LOCALADMEMBER$', creds.hash)
+        self.assertIn('SAMBA.EXAMPLE.COM', creds.hash)
+        self.assertEqual(creds.context['Type'], 'Kerberoasting')
+
+
+class KerberosRealPcapKrb5v2Test(unittest.TestCase):
+    """
+    Integration tests against the mixed Kerberos capture (KRB5-2.pcap).
+
+    Notable principals in this capture:
+      - lulu@EXAMPLE.COM                            : AS-REP Roasting (etype 23 + 18) + AS-REQ Pre-auth
+      - choppydog@PICKLESWORTH                      : AS-REQ Pre-auth
+      - vladg@VLADG.NET                             : Kerberoasting (krbtgt service)
+      - valid_client_principal@VLADG.NET            : AS-REP Roasting
+      - requires_preauth_client_principal@VLADG.NET : AS-REQ Pre-auth + AS-REP Roasting
+      - lockout_policy_client_principal@VLADG.NET   : AS-REQ Pre-auth
+    """
+
+    def setUp(self):
+        abspath = os.path.abspath(__file__)
+        os.chdir(os.path.dirname(abspath))
+        self.credentials_list = process_pcap('samples/KRB5-2.pcap').get_list_of_all_credentials()
+        self.krb_creds = [c for c in self.credentials_list if c.context.get('Type') in
+                          ('AS-REQ Pre-auth', 'AS-REP Roasting', 'Kerberoasting')]
+
+    def _find(self, username, hash_type):
+        for c in self.krb_creds:
+            if c.username == username and c.context.get('Type') == hash_type:
+                return c
+        return None
+
+    def test_lulu_as_rep_roasting(self):
+        """lulu@EXAMPLE.COM AS-REP Roasting hash extracted."""
+        creds = self._find('lulu', 'AS-REP Roasting')
+        self.assertIsNotNone(creds, 'lulu AS-REP Roasting not found')
+        self.assertTrue(creds.hash.startswith('$krb5asrep$'))
+        self.assertIn('lulu@EXAMPLE.COM', creds.hash)
+        self.assertEqual(creds.context['Type'], 'AS-REP Roasting')
+        # checksum:enc_data split must be present
+        colon_pos = creds.hash.find(':')
+        self.assertGreater(colon_pos, 0)
+
+    def test_lulu_as_req_preauth(self):
+        """lulu@EXAMPLE.COM AS-REQ Pre-auth hash extracted."""
+        creds = self._find('lulu', 'AS-REQ Pre-auth')
+        self.assertIsNotNone(creds, 'lulu AS-REQ Pre-auth not found')
+        self.assertTrue(creds.hash.startswith('$krb5pa$'))
+        self.assertIn('lulu', creds.hash)
+        self.assertIn('EXAMPLE.COM', creds.hash)
+
+    def test_choppydog_as_req_preauth(self):
+        """choppydog@PICKLESWORTH AS-REQ Pre-auth hash extracted (AES256)."""
+        creds = self._find('choppydog', 'AS-REQ Pre-auth')
+        self.assertIsNotNone(creds, 'choppydog AS-REQ Pre-auth not found')
+        self.assertTrue(creds.hash.startswith('$krb5pa$'))
+        self.assertIn('choppydog', creds.hash)
+        self.assertIn('PICKLESWORTH', creds.hash)
+        self.assertEqual(creds.context['EType'], '18')   # AES256
+
+    def test_vladg_kerberoasting(self):
+        """vladg@VLADG.NET Kerberoasting hash extracted."""
+        creds = self._find('vladg', 'Kerberoasting')
+        self.assertIsNotNone(creds, 'vladg Kerberoasting not found')
+        self.assertTrue(creds.hash.startswith('$krb5tgs$'))
+        self.assertIn('vladg', creds.hash)
+        self.assertIn('VLADG.NET', creds.hash)
+        self.assertEqual(creds.context['Type'], 'Kerberoasting')
+
+    def test_valid_client_principal_as_rep_roasting(self):
+        """valid_client_principal@VLADG.NET AS-REP Roasting hash extracted."""
+        creds = self._find('valid_client_principal', 'AS-REP Roasting')
+        self.assertIsNotNone(creds, 'valid_client_principal AS-REP Roasting not found')
+        self.assertTrue(creds.hash.startswith('$krb5asrep$'))
+        self.assertIn('valid_client_principal@VLADG.NET', creds.hash)
+        # Must have checksum:enc_data structure after the realm
+        self.assertIn(':', creds.hash)
+
+    def test_requires_preauth_principal_preauth(self):
+        """requires_preauth_client_principal AS-REQ Pre-auth hash extracted."""
+        creds = self._find('requires_preauth_client_principal', 'AS-REQ Pre-auth')
+        self.assertIsNotNone(creds, 'requires_preauth_client_principal AS-REQ Pre-auth not found')
+        self.assertTrue(creds.hash.startswith('$krb5pa$'))
+        self.assertIn('requires_preauth_client_principal', creds.hash)
+        self.assertIn('VLADG.NET', creds.hash)
+
+    def test_lockout_policy_principal_preauth(self):
+        """lockout_policy_client_principal AS-REQ Pre-auth hash extracted."""
+        creds = self._find('lockout_policy_client_principal', 'AS-REQ Pre-auth')
+        self.assertIsNotNone(creds, 'lockout_policy_client_principal AS-REQ Pre-auth not found')
+        self.assertTrue(creds.hash.startswith('$krb5pa$'))
+        self.assertIn('lockout_policy_client_principal', creds.hash)
+        self.assertIn('VLADG.NET', creds.hash)
+
 if __name__ == '__main__':
     unittest.main()
