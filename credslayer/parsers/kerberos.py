@@ -61,7 +61,8 @@ _AS_REQ = "10"
 _AS_REP = "11"
 _TGS_REQ = "12"
 _TGS_REP = "13"
-
+_AP_REQ = "14"
+_KRB_ERROR = "30"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -84,6 +85,23 @@ def _get_all_ciphers(layer: BaseLayer):
     return [f.raw_value for f in fields if f is not None and f.raw_value]
 
 
+def _get_all_msg_types(layer: BaseLayer):
+    """
+    Return every kerberos.msg_type value from *layer* as a list of strings,
+    in the order tshark emits them.  Returns [] when no msg_type field is
+    present.  Compound packets (e.g. FAST AS-REQ+AP-REQ) return multiple
+    values such as ["10", "14"].
+    """
+    f = layer.get_field("msg_type")
+    if f is None:
+        return []
+    try:
+        return [x.show for x in f.all_fields]
+    except AttributeError:
+        val = getattr(layer, "msg_type", None)
+        return [val] if val else []
+
+
 def _split_cipher(cipher_hex: str):
     """
     Split a cipher hex string into (checksum, enc_data) at the 16-byte
@@ -98,34 +116,38 @@ def _split_cipher(cipher_hex: str):
 
 
 def analyse(session: Session, layer: BaseLayer) -> bool:
-    msg_type = getattr(layer, "msg_type", None)
+    msg_types = _get_all_msg_types(layer)
 
-    if msg_type is None:
+    if not msg_types:
         return False
 
-    logger.debug(f"Kerberos msg_type={msg_type}")
+    is_compound = len(msg_types) > 1
 
-    if msg_type == _AS_REQ:
-        _handle_as_req(session, layer)
+    for msg_type in msg_types:
+        logger.debug(f"Kerberos msg_type={msg_type}")
 
-    elif msg_type == _AS_REP:
-        _handle_as_rep(session, layer)
+        if msg_type == _AS_REQ:
+            _handle_as_req(session, layer, is_compound=is_compound)
 
-    elif msg_type == _TGS_REQ:
-        _handle_tgs_req(session, layer)
+        elif msg_type == _AS_REP:
+            _handle_as_rep(session, layer)
 
-    elif msg_type == _TGS_REP:
-        _handle_tgs_rep(session, layer)
+        elif msg_type == _TGS_REQ:
+            _handle_tgs_req(session, layer)
+
+        elif msg_type == _TGS_REP:
+            _handle_tgs_rep(session, layer)
+
+        # _AP_REQ (14) and _KRB_ERROR (30) → intentionally no-op
 
     return True
-
 
 # ---------------------------------------------------------------------------
 # Internal handlers
 # ---------------------------------------------------------------------------
 
 
-def _handle_as_req(session: Session, layer: BaseLayer):
+def _handle_as_req(session: Session, layer: BaseLayer, is_compound: bool = False):
     """
     AS-REQ — record requesting principal and extract PA-ENC-TIMESTAMP cipher.
 
@@ -141,7 +163,14 @@ def _handle_as_req(session: Session, layer: BaseLayer):
         session["krb_realm"] = realm
         logger.info(session, f"Kerberos AS-REQ: {username}@{realm}")
 
-    # PA-ENC-TIMESTAMP cipher is the only cipher in an AS-REQ packet
+    # PA-ENC-TIMESTAMP cipher is the only cipher in a standalone AS-REQ.
+    # In FAST-protected (compound) packets the layer contains ciphers from
+    # the embedded AP-REQ armor as well; ciphers[0] would be the AP-REQ
+    # armor TGT cipher — NOT the user's PA-ENC-TIMESTAMP — which would
+    # produce a crackable-looking but completely wrong hash.  Skip.
+    if is_compound:
+        return
+
     ciphers = _get_all_ciphers(layer)
     if not (username and ciphers):
         return

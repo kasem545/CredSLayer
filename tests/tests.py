@@ -689,5 +689,20 @@ class KerberosRealPcapKrb5v2Test(unittest.TestCase):
         self.assertIn('lockout_policy_client_principal', creds.hash)
         self.assertIn('VLADG.NET', creds.hash)
 
+    def test_no_compound_armor_cipher_in_hashes(self):
+        """
+        Compound (FAST) packets must NOT produce hashes containing the
+        AP-REQ armor TGT cipher.  Packets with msg_type=['10','14'] carry
+        ciphers[0] = AP-REQ armor cipher (6f29cd1f5f5ea014...) which is NOT
+        the user's PA-ENC-TIMESTAMP and must never appear in output hashes.
+        """
+        armor_cipher_prefix = '6f29cd1f5f5ea014'
+        for c in self.krb_creds:
+            self.assertNotIn(
+                armor_cipher_prefix,
+                c.hash,
+                f'AP-REQ armor cipher leaked into hash for {c.username}: {c.hash[:60]}...',
+            )
+
 if __name__ == '__main__':
     unittest.main()
