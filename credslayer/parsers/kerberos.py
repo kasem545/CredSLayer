@@ -219,7 +219,7 @@ def _handle_as_req(session: Session, layer: BaseLayer, is_compound: bool = False
     logger.found(
         session,
         f"Kerberos AS-REQ Pre-auth hash captured for {username}@{realm} "
-        f"(hashcat -m 19900)",
+        f"(hashcat -m 19900):\n{hash_value}",
     )
     session.credentials_list.append(creds)
     # Record index for in-place realm correction when AS-REP arrives.
@@ -287,7 +287,7 @@ def _handle_as_rep(session: Session, layer: BaseLayer):
     logger.found(
         session,
         f"Kerberos AS-REP Roasting hash captured for {username}@{realm} "
-        f"(hashcat -m 18200)",
+        f"(hashcat -m 18200):\n{hash_value}",
     )
     session.credentials_list.append(creds)
 
@@ -348,6 +348,6 @@ def _handle_tgs_rep(session: Session, layer: BaseLayer):
     logger.found(
         session,
         f"Kerberoasting hash captured for service '{svc_label}' "
-        f"(requested by {username}@{realm}) (hashcat -m 13100)",
+        f"(requested by {username}@{realm}) (hashcat -m 13100):\n{hash_value}",
     )
     session.credentials_list.append(creds)
