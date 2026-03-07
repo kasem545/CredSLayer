@@ -363,445 +363,103 @@ class SessionsTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Helpers shared by unit tests
+# pcap-based integration tests for new authentication mechanisms
 # ---------------------------------------------------------------------------
 
-class MockLayer:
-    """Fake pyshark layer – set any attribute via keyword arguments."""
-    def __init__(self, **kwargs):
-        for key, value in kwargs.items():
-            setattr(self, key, value)
 
-
-class MockSession:
-    """
-    Minimal Session-like object that can be used without real pcap packets.
-    Mirrors the dict API, validate/invalidate helpers, and credential tracking
-    that parsers rely on.
-    """
-    def __init__(self):
-        self._data = {}
-        self.protocol = "tcp"
-        self.credentials_being_built = utils.Credentials()
-        self.credentials_list = []
-
-    # --- dict-like interface (Session inherits dict) ---
-    def __getitem__(self, item):
-        return self._data.get(item, None)
-
-    def __setitem__(self, name, value):
-        self._data[name] = value
-
-    def __contains__(self, item):
-        return item in self._data
-
-    def __repr__(self):
-        return "MockSession"
-
-    def clear(self):
-        self._data.clear()
-
-    # --- credential helpers ---
-    def validate_credentials(self):
-        self.credentials_list.append(self.credentials_being_built)
-        self.credentials_being_built = utils.Credentials()
-
-    def invalidate_credentials_and_clear_session(self):
-        self._data.clear()
-        self.credentials_being_built = utils.Credentials()
-
-
-# ---------------------------------------------------------------------------
-# IMAP – new authentication mechanisms
-# ---------------------------------------------------------------------------
-
-class ImapAuthTest(unittest.TestCase):
-    """Unit tests for IMAP AUTHENTICATE PLAIN and LOGIN mechanisms."""
+class ImapAuthIntegrationTest(unittest.TestCase):
+    """Integration tests for IMAP AUTHENTICATE PLAIN and LOGIN mechanisms."""
 
     def setUp(self):
-        from credslayer.parsers import imap
-        self.imap = imap
+        abspath = os.path.abspath(__file__)
+        os.chdir(os.path.dirname(abspath))
 
-    # -- AUTHENTICATE PLAIN --------------------------------------------------
+    def test_authenticate_plain(self):
+        """AUTHENTICATE PLAIN: alice / s3cret extracted from real pcap."""
+        credentials_list = process_pcap("samples/imap-authenticate-plain.pcap").get_list_of_all_credentials()
+        self.assertEqual(len(credentials_list), 1)
+        self.assertTrue(Credentials('alice', 's3cret') in credentials_list)
 
-    def test_authenticate_plain_success(self):
-        """AUTHENTICATE PLAIN: one-step SASL blob, server replies OK."""
-        import base64
-        session = MockSession()
-
-        # C: A001 AUTHENTICATE PLAIN
-        self.imap.analyse(session, MockLayer(request_command="AUTHENTICATE",
-                                              request_parameter="PLAIN"))
-
-        # C: <base64("\0alice\0s3cret")>
-        sasl = base64.b64encode(b"\x00alice\x00s3cret").decode()
-        self.imap.analyse(session, MockLayer(request_command=sasl))
-
-        # S: A001 OK AUTHENTICATE completed
-        self.imap.analyse(session, MockLayer(response="A001 OK AUTHENTICATE completed",
-                                              response_status="OK"))
-
-        self.assertEqual(len(session.credentials_list), 1)
-        self.assertEqual(session.credentials_list[0].username, "alice")
-        self.assertEqual(session.credentials_list[0].password, "s3cret")
-
-    def test_authenticate_plain_failure(self):
-        """AUTHENTICATE PLAIN: server replies NO → credentials must be discarded."""
-        import base64
-        session = MockSession()
-
-        self.imap.analyse(session, MockLayer(request_command="AUTHENTICATE",
-                                              request_parameter="PLAIN"))
-        sasl = base64.b64encode(b"\x00bob\x00wrongpass").decode()
-        self.imap.analyse(session, MockLayer(request_command=sasl))
-        self.imap.analyse(session, MockLayer(response="A001 NO Authentication failed",
-                                              response_status="NO"))
-
-        self.assertEqual(len(session.credentials_list), 0)
-        self.assertIsNone(session.credentials_being_built.username)
-
-    # -- AUTHENTICATE LOGIN --------------------------------------------------
-
-    def test_authenticate_login_success(self):
-        """AUTHENTICATE LOGIN: two-step base64 challenge, server replies OK."""
-        import base64
-        session = MockSession()
-
-        # C: A001 AUTHENTICATE LOGIN
-        self.imap.analyse(session, MockLayer(request_command="AUTHENTICATE",
-                                              request_parameter="LOGIN"))
-
-        # S: + VXNlcm5hbWU=  (server sends 'Username' challenge, client replies)
-        # C: <base64('charlie')>
-        self.imap.analyse(session,
-                          MockLayer(request_command=base64.b64encode(b"charlie").decode()))
-
-        # C: <base64('p@ssw0rd')>
-        self.imap.analyse(session,
-                          MockLayer(request_command=base64.b64encode(b"p@ssw0rd").decode()))
-
-        # S: A001 OK AUTHENTICATE completed
-        self.imap.analyse(session, MockLayer(response="A001 OK AUTHENTICATE completed",
-                                              response_status="OK"))
-
-        self.assertEqual(len(session.credentials_list), 1)
-        self.assertEqual(session.credentials_list[0].username, "charlie")
-        self.assertEqual(session.credentials_list[0].password, "p@ssw0rd")
-
-    def test_authenticate_login_failure(self):
-        """AUTHENTICATE LOGIN: server replies BAD → credentials discarded."""
-        import base64
-        session = MockSession()
-
-        self.imap.analyse(session, MockLayer(request_command="AUTHENTICATE",
-                                              request_parameter="LOGIN"))
-        self.imap.analyse(session,
-                          MockLayer(request_command=base64.b64encode(b"dave").decode()))
-        self.imap.analyse(session,
-                          MockLayer(request_command=base64.b64encode(b"badpass").decode()))
-        self.imap.analyse(session, MockLayer(response="A001 BAD Authentication failed",
-                                              response_status="BAD"))
-
-        self.assertEqual(len(session.credentials_list), 0)
-
-    # -- existing plain LOGIN still works ------------------------------------
-
-    def test_plain_login_still_works(self):
-        """Ensure the original plaintext LOGIN command is not broken."""
-        session = MockSession()
-        # Plaintext: A001 LOGIN "user" "pass" — tshark splits into three quoted tokens
-        self.imap.analyse(session, MockLayer(request_command="LOGIN",
-                                              request='A001 LOGIN "neulingern" "XXXXXX"'))
-        self.imap.analyse(session, MockLayer(response="A001 OK LOGIN completed",
-                                              response_status="OK"))
-
-        self.assertEqual(len(session.credentials_list), 1)
-        self.assertEqual(session.credentials_list[0].username, "neulingern")
-        self.assertEqual(session.credentials_list[0].password, "XXXXXX")
+    def test_authenticate_login(self):
+        """AUTHENTICATE LOGIN: charlie / p@ssw0rd extracted from real pcap."""
+        credentials_list = process_pcap("samples/imap-authenticate-login.pcap").get_list_of_all_credentials()
+        self.assertEqual(len(credentials_list), 1)
+        self.assertTrue(Credentials('charlie', 'p@ssw0rd') in credentials_list)
 
 
-# ---------------------------------------------------------------------------
-# POP3 – USER/PASS and AUTH LOGIN
-# ---------------------------------------------------------------------------
-
-class Pop3AuthTest(unittest.TestCase):
-    """Unit tests for POP3 USER/PASS command flow and AUTH LOGIN mechanism."""
+class Pop3AuthIntegrationTest(unittest.TestCase):
+    """Integration tests for POP3 USER/PASS and AUTH LOGIN mechanisms."""
 
     def setUp(self):
-        from credslayer.parsers import pop
-        self.pop = pop
+        abspath = os.path.abspath(__file__)
+        os.chdir(os.path.dirname(abspath))
 
-    # -- USER / PASS ---------------------------------------------------------
+    def test_user_pass(self):
+        """POP3 USER/PASS: alice / secret123 extracted from real pcap."""
+        credentials_list = process_pcap("samples/pop3-user-pass.pcap").get_list_of_all_credentials()
+        self.assertEqual(len(credentials_list), 1)
+        self.assertTrue(Credentials('alice', 'secret123') in credentials_list)
 
-    def test_user_pass_success(self):
-        """Standard POP3 USER/PASS flow — successful login."""
-        session = MockSession()
-
-        # C: USER alice
-        self.pop.analyse(session, MockLayer(request_command="USER",
-                                             request_parameter="alice"))
-        # S: +OK User accepted
-        self.pop.analyse(session, MockLayer(response_indicator="+OK"))
-
-        # C: PASS secret123
-        self.pop.analyse(session, MockLayer(request_command="PASS",
-                                             request_parameter="secret123"))
-        # S: +OK Pass accepted – authentication succeeded
-        self.pop.analyse(session, MockLayer(response_indicator="+OK"))
-
-        self.assertEqual(len(session.credentials_list), 1)
-        self.assertEqual(session.credentials_list[0].username, "alice")
-        self.assertEqual(session.credentials_list[0].password, "secret123")
-
-    def test_user_pass_failed(self):
-        """POP3 USER/PASS flow — wrong password, -ERR from server."""
-        session = MockSession()
-
-        self.pop.analyse(session, MockLayer(request_command="USER",
-                                             request_parameter="alice"))
-        self.pop.analyse(session, MockLayer(response_indicator="+OK"))
-        self.pop.analyse(session, MockLayer(request_command="PASS",
-                                             request_parameter="wrongpass"))
-        self.pop.analyse(session, MockLayer(response_indicator="-ERR"))
-
-        self.assertEqual(len(session.credentials_list), 0)
-        self.assertIsNone(session.credentials_being_built.username)
-
-    def test_user_ok_does_not_validate(self):
-        """The +OK after USER must not trigger credential validation."""
-        session = MockSession()
-
-        self.pop.analyse(session, MockLayer(request_command="USER",
-                                             request_parameter="eve"))
-        # Server acknowledges USER — this must NOT create a credential entry
-        self.pop.analyse(session, MockLayer(response_indicator="+OK"))
-
-        self.assertEqual(len(session.credentials_list), 0)
-        self.assertEqual(session.credentials_being_built.username, "eve")
-
-    # -- AUTH LOGIN ----------------------------------------------------------
-
-    def test_auth_login_success(self):
-        """POP3 AUTH LOGIN: two-step base64 challenge/response, server +OK."""
-        import base64
-        session = MockSession()
-
-        # C: AUTH LOGIN
-        self.pop.analyse(session, MockLayer(request_command="AUTH",
-                                             request_parameter="LOGIN"))
-
-        # S: + VXNlcm5hbWU=  (challenge: 'Username')
-        # C: <base64('frank')>
-        self.pop.analyse(session,
-                          MockLayer(request_command=base64.b64encode(b"frank").decode()))
-
-        # C: <base64('fr@nkpass')>
-        self.pop.analyse(session,
-                          MockLayer(request_command=base64.b64encode(b"fr@nkpass").decode()))
-
-        # S: +OK Authentication succeeded
-        self.pop.analyse(session, MockLayer(response_indicator="+OK"))
-
-        self.assertEqual(len(session.credentials_list), 1)
-        self.assertEqual(session.credentials_list[0].username, "frank")
-        self.assertEqual(session.credentials_list[0].password, "fr@nkpass")
-
-    def test_auth_login_failure(self):
-        """POP3 AUTH LOGIN: server responds -ERR → credentials discarded."""
-        import base64
-        session = MockSession()
-
-        self.pop.analyse(session, MockLayer(request_command="AUTH",
-                                             request_parameter="LOGIN"))
-        self.pop.analyse(session,
-                          MockLayer(request_command=base64.b64encode(b"grace").decode()))
-        self.pop.analyse(session,
-                          MockLayer(request_command=base64.b64encode(b"badpass").decode()))
-        self.pop.analyse(session, MockLayer(response_indicator="-ERR"))
-
-        self.assertEqual(len(session.credentials_list), 0)
-
-    # -- existing AUTH PLAIN still works ------------------------------------
-
-    def test_auth_plain_still_works(self):
-        """Ensure the existing AUTH PLAIN mechanism is not broken."""
-        import base64
-        session = MockSession()
-
-        self.pop.analyse(session, MockLayer(request_command="AUTH",
-                                             request_parameter="PLAIN"))
-        sasl = base64.b64encode(b"\x00henry\x00h3nrypass").decode()
-        self.pop.analyse(session, MockLayer(request_command=sasl))
-        self.pop.analyse(session, MockLayer(response_indicator="+OK"))
-
-        self.assertEqual(len(session.credentials_list), 1)
-        self.assertEqual(session.credentials_list[0].username, "henry")
-        self.assertEqual(session.credentials_list[0].password, "h3nrypass")
+    def test_auth_login(self):
+        """POP3 AUTH LOGIN: frank / fr@nkpass extracted from real pcap."""
+        credentials_list = process_pcap("samples/pop3-auth-login.pcap").get_list_of_all_credentials()
+        self.assertEqual(len(credentials_list), 1)
+        self.assertTrue(Credentials('frank', 'fr@nkpass') in credentials_list)
 
 
-# ---------------------------------------------------------------------------
-# SMTP – AUTH CRAM-MD5
-# ---------------------------------------------------------------------------
-
-class SmtpAuthCramMd5Test(unittest.TestCase):
-    """Unit tests for SMTP AUTH CRAM-MD5 mechanism."""
+class SmtpCramMd5IntegrationTest(unittest.TestCase):
+    """Integration test for SMTP AUTH CRAM-MD5 mechanism."""
 
     def setUp(self):
-        from credslayer.parsers import smtp
-        self.smtp = smtp
+        abspath = os.path.abspath(__file__)
+        os.chdir(os.path.dirname(abspath))
 
-    def test_auth_cram_md5_success(self):
-        """
-        AUTH CRAM-MD5 flow:
-          C: AUTH CRAM-MD5
-          S: 334 <base64-challenge>
-          C: <base64('username HMAC-MD5-hex')>
-          S: 235 Authentication successful
-        Credentials must contain username and the HMAC-MD5 hash.
-        """
-        import base64
-        session = MockSession()
-
-        challenge = b"<1234.987@mailserver.example>"
-        challenge_b64 = base64.b64encode(challenge).decode()
-
-        # C: AUTH CRAM-MD5
-        self.smtp.analyse(session, MockLayer(req_command="AUTH",
-                                              req_parameter="CRAM-MD5"))
-
-        # S: 334 <base64-challenge>
-        self.smtp.analyse(session, MockLayer(response_code="334",
-                                              response_parameter=challenge_b64))
-
-        # C: <base64('john 3b4e5c...')>   (username + space + HMAC-MD5 hex)
-        cram_response = base64.b64encode(b"john 3b4e5cdeadbeefcafe1234567890ab").decode()
-        self.smtp.analyse(session, MockLayer(req_command=cram_response))
-
-        # S: 235
-        self.smtp.analyse(session, MockLayer(response_code="235"))
-
-        self.assertEqual(len(session.credentials_list), 1)
-        creds = session.credentials_list[0]
-        self.assertEqual(creds.username, "john")
+    def test_auth_cram_md5(self):
+        """AUTH CRAM-MD5: john with HMAC-MD5 hash extracted from real pcap."""
+        credentials_list = process_pcap("samples/smtp-cram-md5.pcap").get_list_of_all_credentials()
+        self.assertEqual(len(credentials_list), 1)
+        creds = credentials_list[0]
+        self.assertEqual(creds.username, 'john')
         self.assertIsNotNone(creds.hash)
-        self.assertIn("3b4e5cdeadbeefcafe1234567890ab", creds.hash)
-
-    def test_auth_cram_md5_failure(self):
-        """AUTH CRAM-MD5 with 535 response must discard credentials."""
-        import base64
-        session = MockSession()
-
-        challenge_b64 = base64.b64encode(b"<9999@host>").decode()
-
-        self.smtp.analyse(session, MockLayer(req_command="AUTH",
-                                              req_parameter="CRAM-MD5"))
-        self.smtp.analyse(session, MockLayer(response_code="334",
-                                              response_parameter=challenge_b64))
-        cram_response = base64.b64encode(b"ivan badhmac").decode()
-        self.smtp.analyse(session, MockLayer(req_command=cram_response))
-        self.smtp.analyse(session, MockLayer(response_code="535"))
-
-        self.assertEqual(len(session.credentials_list), 0)
+        self.assertIn('3b4e5cdeadbeefcafe1234567890abcd', creds.hash)
+        self.assertEqual(creds.context.get('Mechanism'), 'CRAM-MD5')
 
 
-# ---------------------------------------------------------------------------
-# Kerberos – AS-REQ / AS-REP Roasting / Kerberoasting
-# ---------------------------------------------------------------------------
-
-class KerberosParserTest(unittest.TestCase):
-    """
-    Unit tests for the Kerberos parser.
-    All layers are mocked because we have no Kerberos pcap sample.
-    """
+class KerberosIntegrationTest(unittest.TestCase):
+    """Integration tests for Kerberos AS-REP Roasting and Kerberoasting."""
 
     def setUp(self):
-        from credslayer.parsers import kerberos
-        self.kerberos = kerberos
-
-    # -- AS-REQ: username extraction -----------------------------------------
-
-    def test_as_req_extracts_username(self):
-        """AS-REQ (msg_type=10) must record the requesting username in the session."""
-        session = MockSession()
-        layer = MockLayer(
-            msg_type="10",
-            realm="CORP.LOCAL",
-            cname_name_string="jdoe",
-        )
-        self.kerberos.analyse(session, layer)
-
-        self.assertEqual(session["krb_username"], "jdoe")
-        self.assertEqual(session["krb_realm"], "CORP.LOCAL")
-
-    # -- AS-REP Roasting -----------------------------------------------------
+        abspath = os.path.abspath(__file__)
+        os.chdir(os.path.dirname(abspath))
 
     def test_as_rep_roasting(self):
         """
-        AS-REP (msg_type=11) for an account without pre-auth must produce a
-        $krb5asrep$ hash suitable for offline cracking.
+        AS-REQ + AS-REP: jdoe@CORP.LOCAL AS-REP Roasting hash extracted.
+        Hash format: $krb5asrep$<etype>$<username>@<REALM>:<cipher-hex>
         """
-        session = MockSession()
-        session["krb_username"] = "svc_nopreauth"
-        session["krb_realm"] = "CORP.LOCAL"
-
-        layer = MockLayer(
-            msg_type="11",
-            realm="CORP.LOCAL",
-            etype="23",
-            cipher="deadbeef:cafebabe:12345678",
-        )
-        self.kerberos.analyse(session, layer)
-
-        self.assertEqual(len(session.credentials_list), 1)
-        creds = session.credentials_list[0]
-        self.assertEqual(creds.username, "svc_nopreauth")
-        self.assertIsNotNone(creds.hash)
-        self.assertTrue(creds.hash.startswith("$krb5asrep$"))
-        self.assertIn("svc_nopreauth", creds.hash)
-        self.assertIn("CORP.LOCAL", creds.hash)
-        self.assertIn("deadbeefcafebabe12345678", creds.hash)
-        self.assertEqual(creds.context["Type"], "AS-REP Roasting")
-
-    # -- Kerberoasting (TGS-REP) ---------------------------------------------
+        credentials_list = process_pcap("samples/kerberos-as-req-rep.pcap").get_list_of_all_credentials()
+        self.assertEqual(len(credentials_list), 1)
+        creds = credentials_list[0]
+        self.assertEqual(creds.username, 'jdoe')
+        self.assertTrue(creds.hash.startswith('$krb5asrep$'))
+        self.assertIn('jdoe', creds.hash)
+        self.assertIn('CORP.LOCAL', creds.hash)
+        self.assertIn('deadbeefcafebabe12345678', creds.hash)
+        self.assertEqual(creds.context.get('Type'), 'AS-REP Roasting')
 
     def test_tgs_rep_kerberoasting(self):
         """
-        TGS-REP (msg_type=13) must produce a $krb5tgs$ hash for the service
-        ticket, which can be cracked offline to recover the service account
-        password.
+        TGS-REQ + TGS-REP: Kerberoasting hash for MSSQLSvc service extracted.
+        Hash format: $krb5tgs$<etype>$*<username>$<REALM>$<service>*$<cipher-hex>
         """
-        session = MockSession()
-        session["krb_username"] = "jdoe"
-        session["krb_realm"] = "CORP.LOCAL"
-        session["krb_sname"] = "MSSQLSvc/dbserver.corp.local:1433"
-
-        layer = MockLayer(
-            msg_type="13",
-            realm="CORP.LOCAL",
-            etype="23",
-            cipher="aabbccdd:eeff0011:22334455",
-        )
-        self.kerberos.analyse(session, layer)
-
-        self.assertEqual(len(session.credentials_list), 1)
-        creds = session.credentials_list[0]
-        self.assertIsNotNone(creds.hash)
-        self.assertTrue(creds.hash.startswith("$krb5tgs$"))
-        self.assertIn("MSSQLSvc/dbserver.corp.local:1433", creds.hash)
-        self.assertIn("CORP.LOCAL", creds.hash)
-        self.assertIn("aabbccddeeff001122334455", creds.hash)
-        self.assertEqual(creds.context["Type"], "Kerberoasting")
-
-    def test_tgs_req_stores_sname(self):
-        """TGS-REQ (msg_type=12) must store the requested service name for context."""
-        session = MockSession()
-        layer = MockLayer(
-            msg_type="12",
-            sname_name_string="HTTP/webapp.corp.local",
-        )
-        self.kerberos.analyse(session, layer)
-
-        self.assertEqual(session["krb_sname"], "HTTP/webapp.corp.local")
+        credentials_list = process_pcap("samples/kerberos-tgs-req-rep.pcap").get_list_of_all_credentials()
+        self.assertEqual(len(credentials_list), 1)
+        creds = credentials_list[0]
+        self.assertTrue(creds.hash.startswith('$krb5tgs$'))
+        self.assertIn('MSSQLSvc/db.corp.local:1433', creds.hash)
+        self.assertIn('CORP.LOCAL', creds.hash)
+        self.assertIn('aabbccddeeff001122334455', creds.hash)
+        self.assertEqual(creds.context.get('Type'), 'Kerberoasting')
 
 
 if __name__ == '__main__':

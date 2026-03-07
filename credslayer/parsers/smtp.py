@@ -62,12 +62,40 @@ def analyse(session: Session, layer: BaseLayer):
                         session["auth_process_cram_md5"] = True
                         logger.info(session, "SMTP CRAM-MD5 authentication started")
 
-            # --- AUTH CRAM-MD5 client reply (base64 blob, no req_parameter) ---
-            # The client sends: base64("username HMAC-MD5-hex")
-            # tshark surfaces this as req_command when no named field exists.
+            # --- AUTH CRAM-MD5 client reply ---
+            # tshark does NOT parse this as a named SMTP field; the base64
+            # blob appears as an empty-key entry in _all_fields.
+            # Fallback: older tshark may put it in req_command.
             elif session["auth_process_cram_md5"]:
+                raw = ""
+                if hasattr(layer, "_all_fields"):
+                    raw = layer._all_fields.get("", "").strip()
+                if not raw:
+                    raw = command  # fallback: tshark put it in req_command
                 try:
-                    decoded = b64decode(command).decode("utf-8", errors="ignore")
+                    decoded = b64decode(raw).decode("utf-8", errors="ignore")
+                    parts = decoded.split(" ", 1)
+                    if len(parts) == 2:
+                        current_creds.username = parts[0]
+                        challenge_b64 = session["cram_md5_challenge"] or ""
+                        current_creds.hash = "{}:{}".format(challenge_b64, parts[1])
+                        current_creds.context["Mechanism"] = "CRAM-MD5"
+                        session["auth_process_cram_md5"] = False
+                        logger.info(session,
+                                    f"SMTP CRAM-MD5 response for {current_creds.username}")
+                except Exception as e:
+                    logger.info(session, f"SMTP CRAM-MD5 decode error: {e}")
+
+        # ------------------------------------------------------------------
+        # CRAM-MD5 client response: tshark emits the base64 blob as a packet
+        # with ONLY an empty-string field key in _all_fields (no req_command).
+        # Handle it here, outside the req_command guard.
+        # ------------------------------------------------------------------
+        elif session["auth_process_cram_md5"] and not hasattr(layer, "req_command"):
+            raw = layer._all_fields.get("", "").strip() if hasattr(layer, "_all_fields") else ""
+            if raw:
+                try:
+                    decoded = b64decode(raw).decode("utf-8", errors="ignore")
                     parts = decoded.split(" ", 1)
                     if len(parts) == 2:
                         current_creds.username = parts[0]
@@ -116,7 +144,8 @@ def analyse(session: Session, layer: BaseLayer):
             if response_code == 334:
                 # Continuation challenge — capture for CRAM-MD5 context
                 if session["auth_process_cram_md5"]:
-                    challenge_b64 = getattr(layer, "response_parameter", "")
+                    # tshark uses rsp_parameter (not response_parameter)
+                    challenge_b64 = getattr(layer, "rsp_parameter", "")
                     session["cram_md5_challenge"] = challenge_b64
                     logger.info(session, "SMTP CRAM-MD5 challenge received")
 

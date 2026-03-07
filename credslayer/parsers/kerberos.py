@@ -23,13 +23,14 @@ Captures three classes of interesting material:
    Hash format (Hashcat mode 13100):
        $krb5tgs$<etype>$*<username>$<REALM>$<service>*$<cipher-hex>
 
-tshark field → layer attribute mapping (pyshark dot→underscore):
-  kerberos.msg_type           → layer.msg_type
-  kerberos.realm              → layer.realm
-  kerberos.cname.name_string  → layer.cname_name_string
-  kerberos.sname.name_string  → layer.sname_name_string
-  kerberos.etype              → layer.etype
-  kerberos.cipher             → layer.cipher  (colon-separated hex bytes)
+tshark field → layer attribute mapping (pyshark XML mode, prefix stripped):
+  kerberos.msg_type    → layer.msg_type
+  kerberos.realm       → layer.realm      (AS-REQ, TGS-REQ only)
+  kerberos.crealm      → layer.crealm     (AS-REP, TGS-REP only)
+  kerberos.CNameString → layer.CNameString (requesting principal)
+  kerberos.SNameString → layer.SNameString (service name, TGS-REQ only)
+  kerberos.etype       → layer.etype
+  kerberos.cipher      → layer.cipher  (colon-separated hex bytes)
 
 Session state:
   session["krb_username"] : client principal from AS-REQ / AS-REP
@@ -82,7 +83,7 @@ def _handle_as_req(session: Session, layer: BaseLayer):
     """
     AS-REQ — record requesting principal for later use and user enumeration.
     """
-    username = getattr(layer, "cname_name_string", None)
+    username = getattr(layer, "CNameString", None)
     realm = getattr(layer, "realm", None)
 
     if username:
@@ -99,8 +100,8 @@ def _handle_as_rep(session: Session, layer: BaseLayer):
     Capture it so the analyst can attempt offline cracking with hashcat
     (mode 18200).
     """
-    username = session["krb_username"] or getattr(layer, "cname_name_string", None)
-    realm = session["krb_realm"] or getattr(layer, "realm", None)
+    username = session["krb_username"] or getattr(layer, "CNameString", None)
+    realm = session["krb_realm"] or getattr(layer, "crealm", None)
     etype = getattr(layer, "etype", "23")  # default to RC4 if unknown
     cipher = getattr(layer, "cipher", None)
 
@@ -129,7 +130,7 @@ def _handle_tgs_req(session: Session, layer: BaseLayer):
     """
     TGS-REQ — record the requested service name so TGS-REP can reference it.
     """
-    sname = getattr(layer, "sname_name_string", None)
+    sname = getattr(layer, "SNameString", None) or getattr(layer, "snamestring", None)
     if sname:
         session["krb_sname"] = sname
         logger.info(session, f"Kerberos TGS-REQ for service: {sname}")
@@ -144,9 +145,9 @@ def _handle_tgs_rep(session: Session, layer: BaseLayer):
     cipher so the analyst can attempt offline cracking with hashcat
     (mode 13100).
     """
-    username = session["krb_username"] or getattr(layer, "cname_name_string", None)
-    realm = getattr(layer, "realm", None) or session["krb_realm"]
-    sname = session["krb_sname"] or getattr(layer, "sname_name_string", None)
+    username = session["krb_username"] or getattr(layer, "CNameString", None)
+    realm = getattr(layer, "crealm", None) or session["krb_realm"]
+    sname = session["krb_sname"] or getattr(layer, "SNameString", None)
     etype = getattr(layer, "etype", "23")
     cipher = getattr(layer, "cipher", None)
 

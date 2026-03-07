@@ -8,6 +8,16 @@ Supports:
 - AUTHENTICATE PLAIN  (RFC 4616 SASL PLAIN)
 - AUTHENTICATE LOGIN  (two-step base64 challenge/response)
 
+tshark field → layer attribute mapping (pyshark XML mode):
+  imap.request_command  → layer.request_command  (e.g. "AUTHENTICATE", "LOGIN")
+  imap.request          → layer.request          (full request line, e.g. "a002 AUTHENTICATE PLAIN")
+  imap.response         → layer.response         (full response line)
+  imap.response_status  → layer.response_status  (e.g. "OK", "NO", "BAD")
+  imap.response_command → layer.response_command (present on tagged OK/NO responses)
+
+SASL continuation packets have NO request_command — tshark exposes the base64
+blob via layer.request (and layer.request_tag).
+
 Auth state machine stored in the session dict:
   session["imap_auth"]       : None | "PLAIN" | "LOGIN"
   session["imap_auth_step"]  : 0 (waiting username) | 1 (waiting password)
@@ -38,29 +48,32 @@ def analyse(session: Session, layer: BaseLayer):
             session["imap_auth_on"] = True
 
         # ------------------------------------------------------------------
-        # SASL AUTHENTICATE command
+        # SASL AUTHENTICATE command — mechanism is in the full request line
+        # e.g. "a002 AUTHENTICATE PLAIN" → split()[2] = "PLAIN"
         # ------------------------------------------------------------------
         elif command == "AUTHENTICATE":
-            if hasattr(layer, "request_parameter"):
-                mechanism = layer.request_parameter.upper()
-                if mechanism == "PLAIN":
-                    session["imap_auth"] = "PLAIN"
-                    session["imap_auth_on"] = True
-                    logger.info(session, "IMAP AUTHENTICATE PLAIN started")
-                elif mechanism == "LOGIN":
-                    session["imap_auth"] = "LOGIN"
-                    session["imap_auth_step"] = 0
-                    session["imap_auth_on"] = True
-                    logger.info(session, "IMAP AUTHENTICATE LOGIN started")
+            parts = layer.request.split()
+            mechanism = parts[2].upper() if len(parts) >= 3 else ""
+            if mechanism == "PLAIN":
+                session["imap_auth"] = "PLAIN"
+                session["imap_auth_on"] = True
+                logger.info(session, "IMAP AUTHENTICATE PLAIN started")
+            elif mechanism == "LOGIN":
+                session["imap_auth"] = "LOGIN"
+                session["imap_auth_step"] = 0
+                session["imap_auth_on"] = True
+                logger.info(session, "IMAP AUTHENTICATE LOGIN started")
 
-        # ------------------------------------------------------------------
-        # Continuation data (SASL payload sent without a tagged command)
-        # ------------------------------------------------------------------
-        elif session["imap_auth"] == "PLAIN":
-            # Entire SASL PLAIN blob: base64("\0authzid\0authcid\0passwd")
+    # -----------------------------------------------------------------------
+    # SASL continuation blobs: no request_command, base64 data in layer.request
+    # -----------------------------------------------------------------------
+    elif hasattr(layer, "request") and not hasattr(layer, "request_command"):
+        blob = layer.request.strip()
+
+        if session["imap_auth"] == "PLAIN":
             try:
                 current_creds.username, current_creds.password = utils.parse_sasl_creds(
-                    command, "PLAIN"
+                    blob, "PLAIN"
                 )
                 logger.info(session, f"IMAP PLAIN auth user: {current_creds.username}")
             except Exception as e:
@@ -71,7 +84,7 @@ def analyse(session: Session, layer: BaseLayer):
         elif session["imap_auth"] == "LOGIN":
             step = session["imap_auth_step"] or 0
             try:
-                decoded = base64.b64decode(command).decode("utf-8", errors="ignore")
+                decoded = base64.b64decode(blob).decode("utf-8", errors="ignore")
                 if step == 0:
                     current_creds.username = decoded
                     session["imap_auth_step"] = 1
@@ -87,16 +100,15 @@ def analyse(session: Session, layer: BaseLayer):
     # ----------------------------------------------------------------------
     # Server response — validate or discard pending credentials
     # ----------------------------------------------------------------------
-    # Due to an incompatibility with "old" tshark versions, we cannot use
-    # response_command, so we parse the full response string instead.
     elif hasattr(layer, "response"):
         response = layer.response
-        status = layer.response_status
+        status = getattr(layer, "response_status", "")
 
         auth_in_progress = (
             session["imap_auth_on"]
             or " LOGIN " in response
             or " AUTHENTICATE " in response
+            or getattr(layer, "response_command", "") == "AUTHENTICATE"
         )
 
         if auth_in_progress:
